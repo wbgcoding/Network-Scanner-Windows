@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Scanner output
+network_scan_*.txt
+
+# Config (contains local network info)
+network_scanner.conf
+
+# IDE
+.vscode/
+.idea/
+
+# Claude
+CLAUDE.md
+.claude/
+.remember/
+.omg/
+
+
+BACKUP.bat
+*.txt
+*.conf

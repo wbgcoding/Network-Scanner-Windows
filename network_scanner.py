@@ -2594,19 +2594,19 @@ class LiveTable:
             return max(0, round(pb_len * count / total))
 
         s = _blocks(self.ping_success)
-        f = _blocks(self.ping_failed)     # red  — sent, no reply
-        k = _blocks(self.ping_skipped)    # gray — skipped (offline / 5-fail)
-        # Clamp so rounding never pushes us past pb_len
+        f = _blocks(self.ping_failed)
+        k = _blocks(self.ping_skipped)
+        # Clamp so rounding never pushes the bar past pb_len.
         s = min(s, pb_len)
         f = min(f, pb_len - s)
         k = min(k, pb_len - s - f)
         r = pb_len - s - f - k
 
         chars = (
-            [f"\033[92m█{COLOR_RESET}"] * s +        # bright green  — success
-            [f"\033[91m█{COLOR_RESET}"] * f +        # bright red    — failed
-            [f"\033[90m█{COLOR_RESET}"] * k +        # gray block    — skipped
-            [f"{COLOR_DARK_GRAY}░{COLOR_RESET}"] * r # outline       — remaining
+            [f"\033[92m█{COLOR_RESET}"] * s +
+            [f"\033[91m█{COLOR_RESET}"] * f +
+            [f"\033[90m█{COLOR_RESET}"] * k +
+            [f"{COLOR_DARK_GRAY}░{COLOR_RESET}"] * r
         )
         return self._overlay_center(chars, center_text, pb_len, center_color)
 

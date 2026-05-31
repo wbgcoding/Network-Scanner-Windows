@@ -2316,6 +2316,13 @@ class LiveTable:
                     o.hostname = device.hostname
                 o.current_pings = device.current_pings
                 o.target_pings = device.target_pings
+            # The own IP can't be resolved via ARP, so whenever the local row is
+            # created or updated, stamp the known local MAC on it (regardless of
+            # the order in which discovery and set_local_mac() happen).
+            entry = self.devices[device.ip]
+            if (self.local_ip and device.ip == self.local_ip and self.local_mac
+                    and (not entry.mac_address or entry.mac_address == UNKNOWN_VALUE)):
+                entry.mac_address = self.local_mac
         self.request_render()   # live redraw when a device's ping data changes
 
     def bump_completed(self, n: int = 1) -> None:
@@ -2373,6 +2380,26 @@ class LiveTable:
             if 0 <= pos < pb_len:
                 chars[pos] = f"{color}{ch}{COLOR_RESET}"
         return "".join(chars)
+
+    @staticmethod
+    def _ping_cell(value: Optional[float], mark: str, na: str,
+                   width: int = COL_PING_WIDTH) -> str:
+        """Format one ping value centered in a COL_PING_WIDTH cell. An optional
+        red/green marker (block + space) is placed INSIDE the left padding so the
+        value itself stays at exactly the same column whether or not it is marked
+        — the colour mark never shifts the actual ping value."""
+        if value is None:
+            return format_cell_center(na, width)
+        c, r = colorize_ping(value)
+        plain = format_float(value)
+        pad = max(0, width - len(plain))
+        left = pad // 2
+        right = pad - left
+        if mark and left >= 2:            # mark is 2 visible chars ("█ ")
+            left_str = " " * (left - 2) + mark
+        else:
+            left_str = " " * left
+        return f"{left_str}{c}{plain}{r}{' ' * right}"
 
     def _build_ping_bar(self, pb_len: int, center_text: str,
                         center_color: str = COLOR_BOLD + COLOR_WHITE) -> str:
@@ -2724,16 +2751,13 @@ class LiveTable:
             status = STATUS_ONLINE if online else STATUS_OFFLINE
             na = f"{COLOR_DARK_GRAY}N/A{COLOR_RESET}"
             if online:
-                ac, ar = colorize_ping(d.ping_stats.get('avg'))
-                mc, mr = colorize_ping(d.ping_stats.get('max')) if d.ping_stats.get('max') else (COLOR_WHITE, COLOR_RESET)
-                nc, nr = colorize_ping(d.ping_stats.get('min')) if d.ping_stats.get('min') else (COLOR_WHITE, COLOR_RESET)
-                avg_text = f"{_mark(ip, avg_hi, avg_lo)}{ac}{format_float(d.ping_stats.get('avg'))}{ar}" if d.ping_stats.get('avg') else na
-                max_text = f"{_mark(ip, max_hi, max_lo)}{mc}{format_float(d.ping_stats.get('max'))}{mr}" if d.ping_stats.get('max') else na
-                min_text = f"{_mark(ip, min_hi, min_lo)}{nc}{format_float(d.ping_stats.get('min'))}{nr}" if d.ping_stats.get('min') else na
-                lc, lr = colorize_ping(d.last_ping) if d.last_ping is not None else (COLOR_WHITE, COLOR_RESET)
-                last_text = f"{_mark(ip, last_hi, last_lo)}{lc}{format_float(d.last_ping)}{lr}" if d.last_ping is not None else na
+                avg_cell  = self._ping_cell(d.ping_stats.get('avg'), _mark(ip, avg_hi, avg_lo), na)
+                min_cell  = self._ping_cell(d.ping_stats.get('min'), _mark(ip, min_hi, min_lo), na)
+                max_cell  = self._ping_cell(d.ping_stats.get('max'), _mark(ip, max_hi, max_lo), na)
+                last_cell = self._ping_cell(d.last_ping,             _mark(ip, last_hi, last_lo), na)
             else:
-                avg_text = min_text = max_text = last_text = na
+                na_cell = format_cell_center(na, COL_PING_WIDTH)
+                avg_cell = min_cell = max_cell = last_cell = na_cell
 
             mac = d.mac_address or UNKNOWN_VALUE
             # Hostname column: real name → magenta; if unknown, fall back to the
@@ -2793,10 +2817,7 @@ class LiveTable:
                 format_cell_center(group_text, COL_GROUP_WIDTH) +
                 " " +
                 format_cell(host_color, COL_HOSTNAME_WIDTH) +
-                format_cell_center(avg_text, COL_PING_WIDTH) +
-                format_cell_center(min_text, COL_PING_WIDTH) +
-                format_cell_center(max_text, COL_PING_WIDTH) +
-                format_cell_center(last_text, COL_PING_WIDTH) +
+                avg_cell + min_cell + max_cell + last_cell +
                 format_cell_center(progress_text, COL_PROGRESS_WIDTH) +
                 mac_cell
             )
@@ -3215,7 +3236,10 @@ def _seed_device_identity(lt: "Optional[LiveTable]", ip: str,
     known/DB devices start pinging immediately."""
     if local_ip and ip == local_ip:
         # Docker Desktop injects "host.docker.internal" → use the real machine name.
-        return local_mac, platform.node()
+        # Prefer the live local MAC (resolved in the background) over the possibly
+        # not-yet-known value captured when the scan started.
+        own_mac = (lt.local_mac if lt and lt.local_mac else local_mac)
+        return own_mac, platform.node()
     if lt:
         with lt.lock:
             existing = lt.devices.get(ip)

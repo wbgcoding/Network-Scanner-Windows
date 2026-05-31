@@ -3009,6 +3009,55 @@ def ping_succeeded(returncode: int, stdout: str) -> bool:
     return not any(b in low for b in bad)
 
 
+def _seed_device_identity(lt: "Optional[LiveTable]", ip: str,
+                          local_ip: Optional[str], local_mac: Optional[str]):
+    """Return (mac, hostname) for a host WITHOUT any slow lookup. Uses the local
+    node name for our own IP and any values already known from the DB pre-load;
+    everything else stays None and is resolved later — and only AFTER the host has
+    actually replied. This keeps the ~9.45s reverse-DNS stall off the ping path so
+    known/DB devices start pinging immediately."""
+    if local_ip and ip == local_ip:
+        # Docker Desktop injects "host.docker.internal" → use the real machine name.
+        return local_mac, platform.node()
+    if lt:
+        with lt.lock:
+            existing = lt.devices.get(ip)
+        if existing:
+            mac = (existing.mac_address
+                   if existing.mac_address and existing.mac_address != UNKNOWN_VALUE else None)
+            host = (existing.hostname
+                    if existing.hostname and existing.hostname != UNKNOWN_VALUE else None)
+            return mac, host
+    return None, None
+
+
+def _resolve_device_identity(ip: str, dev: Device, lt: "Optional[LiveTable]", system: str,
+                             local_ip: Optional[str], local_mac: Optional[str]) -> None:
+    """Resolve MAC / hostname for a host that just came online. Runs in a daemon
+    thread so the slow reverse-DNS / NetBIOS lookups never stall the ping loop —
+    the device already shows as online; its name just fills in a moment later."""
+    if dev.mac_address is None or dev.mac_address == UNKNOWN_VALUE:
+        refreshed = get_mac_address(ip, system, local_ip, local_mac)
+        if refreshed:
+            dev.mac_address = refreshed
+    if dev.hostname is None or dev.hostname == UNKNOWN_VALUE:
+        h = get_hostname(ip)
+        if h:
+            dev.hostname = h
+    # Cross-subnet fallback: a direct NetBIOS query reaches hosts that reverse
+    # DNS / ARP cannot (different subnet, no PTR).
+    need_host = dev.hostname is None or dev.hostname == UNKNOWN_VALUE
+    need_mac = dev.mac_address is None or dev.mac_address == UNKNOWN_VALUE
+    if system == "Windows" and (need_host or need_mac):
+        nb_name, nb_mac = _netbios_lookup(ip)
+        if need_host and nb_name:
+            dev.hostname = nb_name
+        if need_mac and nb_mac:
+            dev.mac_address = nb_mac
+    if lt:
+        lt.update_device(dev)
+
+
 def ping_host_multiple(
     ip: str,
     count: int = DEFAULT_PING_COUNT,
@@ -3021,9 +3070,9 @@ def ping_host_multiple(
     """Ping a host multiple times and return a Device with collected stats.
     count == PING_COUNT_INFINITE pings forever until the scan is stopped."""
     system = platform.system()
-    mac = get_mac_address(ip, system, local_ip, local_mac)
-    # Docker Desktop injects "host.docker.internal" → use the real machine name
-    host = platform.node() if (local_ip and ip == local_ip) else get_hostname(ip)
+    # Identity is seeded WITHOUT a network lookup (no upfront reverse DNS / arp);
+    # the ping fires immediately and the name is resolved after the first reply.
+    mac, host = _seed_device_identity(lt, ip, local_ip, local_mac)
 
     lats: List[float] = []
     dev = Device(ip=ip, mac_address=mac, hostname=host, target_pings=count, current_pings=0)
@@ -3076,26 +3125,17 @@ def _ping_loop(ip, count, lt, ctrl, local_ip, local_mac, dev, lats, system,
                 if lt:
                     lt.record_ping(True)
                 if succ == 1:
-                    # ARP cache is populated after the first reply — refresh MAC.
-                    if dev.mac_address is None or dev.mac_address == UNKNOWN_VALUE:
-                        refreshed = get_mac_address(ip, system, local_ip, local_mac)
-                        if refreshed:
-                            dev.mac_address = refreshed
-                    # Resolve hostname via reverse DNS once the host is confirmed up.
-                    if dev.hostname is None or dev.hostname == UNKNOWN_VALUE:
-                        h = get_hostname(ip)
-                        if h:
-                            dev.hostname = h
-                    # Cross-subnet fallback: a direct NetBIOS query reaches hosts
-                    # that reverse DNS / ARP cannot (different subnet, no PTR).
-                    need_host = dev.hostname is None or dev.hostname == UNKNOWN_VALUE
-                    need_mac = dev.mac_address is None or dev.mac_address == UNKNOWN_VALUE
-                    if system == "Windows" and (need_host or need_mac):
-                        nb_name, nb_mac = _netbios_lookup(ip)
-                        if need_host and nb_name:
-                            dev.hostname = nb_name
-                        if need_mac and nb_mac:
-                            dev.mac_address = nb_mac
+                    # First reply: resolve any still-unknown MAC/hostname in a
+                    # daemon thread so the slow reverse-DNS / NetBIOS lookups never
+                    # stall this ping loop. Known/DB devices are already seeded, so
+                    # this is skipped for them entirely.
+                    if (dev.mac_address is None or dev.mac_address == UNKNOWN_VALUE
+                            or dev.hostname is None or dev.hostname == UNKNOWN_VALUE):
+                        threading.Thread(
+                            target=_resolve_device_identity,
+                            args=(ip, dev, lt, system, local_ip, local_mac),
+                            daemon=True
+                        ).start()
                 if latency is not None:
                     lats.append(latency)
                     dev.last_ping = latency   # most recently measured value

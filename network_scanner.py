@@ -2216,7 +2216,6 @@ class LiveTable:
     def _render_internal_locked(self, clear_first: bool = False):
         output = []
         output.append(f"{COLOR_BLUE}{'=' * self.table_width}{COLOR_RESET}")
-        output.append("")  # one blank line so the title sits one row lower
 
         # Phase + spinner on the left
         phi = f"{COLOR_CYAN}{self.phase_number}{COLOR_RESET} - {COLOR_BRIGHT_WHITE}{self.current_phase}"
@@ -2238,7 +2237,7 @@ class LiveTable:
         subnets_block = ""
         subnets_vis = 0
         if self.known_network:
-            kn = f"\033[38;5;{self.gateway_color}m███{COLOR_RESET} "
+            kn = f"\033[1;38;5;{self.gateway_color}m###{COLOR_RESET} "
             subnets_block = kn
             subnets_vis = get_visible_len(kn)
         if self.scanned_subnets:
@@ -2533,9 +2532,8 @@ class LiveTable:
                 """Strip ANSI codes."""
                 return re.sub(r'\033\[[0-9;]*m', '', s)
 
-            # Header separator + blank line (title sits one row lower)
+            # Header separator
             lines.append("=" * self.table_width)
-            lines.append("")
 
             # Title line: phase on the left, title centred,
             # "Threads: N  Subnets: ..." on the right — mirrors the live view.

@@ -2406,7 +2406,7 @@ class LiveTable:
         with self.lock:
             return self._render_internal_locked(clear_first=clear_first)
 
-    def _render_internal_locked(self, clear_first: bool = False):
+    def _render_internal_locked(self, clear_first: bool = False, _rebuilding: bool = False):
         output = []
         output.append(f"{COLOR_BLUE}{'=' * self.table_width}{COLOR_RESET}")
 
@@ -2687,6 +2687,18 @@ class LiveTable:
                 hint = f"{COLOR_DARK_GRAY}{CONTROLS_HINT_RUNNING}{COLOR_RESET}"
             pad = max(0, (self.table_width - get_visible_len(hint)) // 2)
             output.append(" " * pad + hint)
+
+        # On every update, check the widest output line and the window width; if any
+        # line needs more room than the current table width, grow to fit, resize +
+        # re-centre the console, and rebuild ONCE so this very frame already fits
+        # (no wrap, no flicker). Width only ever grows, never shrinks below TABLE_WIDTH.
+        content_w = max((get_visible_len(line) for line in output), default=0)
+        needed = max(TABLE_WIDTH, content_w)
+        if needed > self.table_width and not _rebuilding:
+            self.table_width = needed
+            _resize_terminal(needed + CONSOLE_BORDER_MARGIN)
+            _center_console_window()
+            return self._render_internal_locked(clear_first=clear_first, _rebuilding=True)
 
         self._write_frame(output, clear_first)
 

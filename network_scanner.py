@@ -3656,12 +3656,10 @@ def main(ping_count: int = DEFAULT_PING_COUNT, high_pressure: bool = False) -> s
     _hard_clear()
     live_table._render(force=True, clear_first=True)
 
-    # Q during scan → show final state + exit (no restart menu). Print the saved
-    # path here since the controls menu won't be shown in that case.
-    if control.stop_requested:
-        if _last_results_path:
-            print(f"\nResults saved to: {COLOR_GREEN}{_last_results_path}{COLOR_RESET}")
-        return 'exit'
+    # Both a finished scan and a Q ("Abbrechen, Ergebnis speichern") land here:
+    # results are saved and the restart controls menu is shown (which displays
+    # the saved-results path beneath it). Only ESC quits immediately — it never
+    # reaches this point because _hard_exit_now() exits the process directly.
     return 'completed'
 
 

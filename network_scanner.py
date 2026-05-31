@@ -455,6 +455,11 @@ PING_COUNT_INFINITE: int = -1
 # ── Discovery Phase ──────────────────────────────────────────────────────────
 DISCOVERY_PING_COUNT: int = 1
 ANALYSIS_MAX_CONSECUTIVE_FAILURES: int = 5  # Stop pinging a device after this many consecutive failures
+# Offline re-probe: a device that didn't answer is retried once every this many
+# seconds for the rest of the run. The first reply promotes it back online and
+# starts its normal ping cycle. Each IP is promoted at most once (bounded work).
+OFFLINE_RETRY_INTERVAL_SECONDS: int = 5
+OFFLINE_RETRY_WORKERS: int = 32   # parallel re-probe pings per retry cycle
 
 # ── Subnet Scanning ──────────────────────────────────────────────────────────
 SUBNET_FIRST_IP: int = 1
@@ -1628,6 +1633,20 @@ def format_num(n: int) -> str:
     return f"{n:,}".replace(',', '.')
 
 
+def format_num_short(n: int) -> str:
+    """Abbreviate a large MAX/target value for the progress bars: 1000 -> '1k',
+    1500 -> '1,5k', 1000000 -> '1M'. Values below 1000 are returned unchanged so
+    they stay exact. Only used for the bar's denominator (the ceiling); the actual
+    running count keeps format_num() so every single ping is still shown in full."""
+    n = int(n)
+    for divisor, suffix in ((1_000_000_000, 'B'), (1_000_000, 'M'), (1_000, 'k')):
+        if abs(n) >= divisor:
+            value = n / divisor
+            text = f"{value:.1f}".rstrip('0').rstrip('.')  # 1.0 -> '1', 1.5 -> '1.5'
+            return f"{text}{suffix}".replace('.', ',')      # German decimal comma
+    return str(n)
+
+
 def format_float(n: float) -> str:
     """Format a ping value: dot thousands separator, comma decimals, 'ms' suffix.
     A whole number drops the ',00' decimals entirely (e.g. 5ms, not 5,00ms)."""
@@ -2192,6 +2211,18 @@ class LiveTable:
             self.total_pings_completed = self.ping_success + self.ping_failed + self.ping_skipped
         self.request_render()   # live redraw when pings are skipped
 
+    def reclaim_skipped(self, n: int) -> None:
+        """Give back n previously-skipped pings. Used when an offline device comes
+        back online mid-run: its planned pings were counted as skipped, so we undo
+        that before its normal ping cycle records them for real (keeps the pings
+        bar consistent — total target is unchanged)."""
+        if n <= 0:
+            return
+        with self.lock:
+            self.ping_skipped = max(0, self.ping_skipped - n)
+            self.total_pings_completed = self.ping_success + self.ping_failed + self.ping_skipped
+        self.request_render()
+
     @staticmethod
     def _overlay_center(chars: List[str], center_text: str, pb_len: int) -> str:
         """Overlay center_text (bold white) onto the middle of a bar's cell list
@@ -2434,7 +2465,7 @@ class LiveTable:
             ping_count_text = f"{format_num(done)}/{INFINITE_SYMBOL}"
         elif self.total_pings_target > 0:
             ping_center = f"{done / self.total_pings_target * 100:.0f}%"
-            ping_count_text = f"{format_num(done)}/{format_num(self.total_pings_target)}"
+            ping_count_text = f"{format_num(done)}/{format_num_short(self.total_pings_target)}"
         else:
             ping_center, ping_count_text = "0%", "0/0"
         ping_bar_str = (
@@ -2578,7 +2609,7 @@ class LiveTable:
 
             if online:
                 target_disp = (INFINITE_SYMBOL if d.target_pings == PING_COUNT_INFINITE
-                               else format_num(d.target_pings))
+                               else format_num_short(d.target_pings))
                 progress_text = f"{COLOR_GREEN}{format_num(d.current_pings)}{COLOR_RESET}/{COLOR_GREEN}{target_disp}{COLOR_RESET}"
             else:
                 progress_text = na
@@ -2738,7 +2769,7 @@ class LiveTable:
                 pct = 100.0
                 filled = pb_len
                 pct_text = f"{pct:.0f}%"
-                ping_bar_str = f"{PINGS_LABEL}{self._build_bar(pb_len, filled, pct_text)} {format_num(self.total_pings_completed)}/{format_num(self.total_pings_target)}"
+                ping_bar_str = f"{PINGS_LABEL}{self._build_bar(pb_len, filled, pct_text)} {format_num(self.total_pings_completed)}/{format_num_short(self.total_pings_target)}"
 
             dev_bar_str = ""
             if self.total_count > 0:
@@ -2819,7 +2850,7 @@ class LiveTable:
 
                 if online:
                     target_disp = (INFINITE_SYMBOL if d.target_pings == PING_COUNT_INFINITE
-                                   else format_num(d.target_pings))
+                                   else format_num_short(d.target_pings))
                     progress = f"{format_num(d.current_pings)}/{target_disp}"
                     avg = format_float(d.ping_stats.get('avg')) if d.ping_stats.get('avg') else "N/A"
                     mn  = format_float(d.ping_stats.get('min')) if d.ping_stats.get('min') else "N/A"
@@ -3202,6 +3233,15 @@ def _merge_known_devices(live_table: "LiveTable", db_path: str, gateway_mac: str
             live_table.devices[kd.ip] = kd
 
 
+def _offline_retry_candidates(ip_range: List[str], online_ips: "set",
+                              local_ip: "Optional[str]", promoted: "set") -> List[str]:
+    """IPs eligible for a periodic offline re-probe this cycle: in the scanned
+    range, not currently online, not the local host, and not already promoted
+    (each IP is promoted back online at most once). Order is preserved."""
+    return [ip for ip in ip_range
+            if ip not in online_ips and ip != local_ip and ip not in promoted]
+
+
 def _prioritize_known_ips(ip_range: List[str], known_ips: "set") -> List[str]:
     """Move IPs that are already known (pre-loaded from the DB) to the front of the
     discovery queue so their pings start in the very first sweep instead of waiting
@@ -3309,10 +3349,68 @@ def scan_subnet(
         # the rest of the subnet is still being discovered.
         analyse = ping_count != 0
         analysis_executor = ThreadPoolExecutor(max_workers=max_workers) if analyse else None
-        analysis_futures = []
+        analysis_futures = []          # initial online-device cycles (counted via callback)
+        analysis_lock = threading.Lock()
+        promoted = set()               # offline IPs already brought back online (once each)
+        promoted_futures = []          # ping cycles for promoted devices (already counted)
+        scan_active = threading.Event()
+        scan_active.set()
+        system = platform.system()
 
         def _on_analysis_done(_fut):
             live_table.bump_completed()
+
+        def _promote_offline(ip):
+            """A previously-offline device answered a re-probe: reclaim its skipped
+            pings and start its normal ping cycle. Completion is NOT re-counted —
+            the IP was already counted as processed during discovery."""
+            with analysis_lock:
+                if ip in promoted or not scan_active.is_set():
+                    return
+                promoted.add(ip)
+            if analyse and not infinite:
+                live_table.reclaim_skipped(analysis_per_ip)
+            try:
+                af = analysis_executor.submit(ping_host_multiple, ip, ping_count,
+                                              live_table, control, local_ip, local_mac, interval_ms)
+            except RuntimeError:
+                return   # executor already shutting down
+            with analysis_lock:
+                promoted_futures.append(af)
+
+        def _probe_offline(ip):
+            """Single detection ping for an offline IP (not counted on the bar)."""
+            if control and (control.should_exit_task() or not scan_active.is_set()):
+                return
+            if control:
+                control.wait_if_paused()
+                if control.should_exit_task():
+                    return
+            success, _lat = measure_ping(ip, system)
+            if success:
+                _promote_offline(ip)
+
+        def _offline_monitor():
+            """Re-probe offline IPs every OFFLINE_RETRY_INTERVAL_SECONDS while the
+            scan runs; promote any that come online. The detection pings are kept
+            off the progress bar — only a promoted device's real cycle counts."""
+            probe_pool = ThreadPoolExecutor(max_workers=OFFLINE_RETRY_WORKERS)
+            try:
+                while scan_active.is_set() and not control.should_exit_task():
+                    _interruptible_sleep(OFFLINE_RETRY_INTERVAL_SECONDS, control)
+                    if not scan_active.is_set() or control.should_exit_task():
+                        break
+                    control.wait_if_paused()
+                    with live_table.lock:
+                        online_ips = {d.ip for d in live_table.devices.values() if d.ping_status}
+                    with analysis_lock:
+                        done = set(promoted)
+                    for ip in _offline_retry_candidates(ip_range, online_ips, local_ip, done):
+                        if not scan_active.is_set() or control.should_exit_task():
+                            break
+                        probe_pool.submit(_probe_offline, ip)
+            finally:
+                probe_pool.shutdown(wait=False)
 
         disc_executor = ThreadPoolExecutor(max_workers=init_workers)
         disc_futures = {
@@ -3334,12 +3432,18 @@ def scan_subnet(
                 analysis_futures.append(af)
             else:
                 # Offline host (or analysis disabled): processed now; its planned
-                # analysis pings count as skipped on the pings bar.
+                # analysis pings count as skipped on the pings bar (reclaimed later
+                # if the offline monitor brings this device back online).
                 if analyse and not infinite:
                     live_table.record_skipped(analysis_per_ip)
                 live_table.bump_completed()
             _maybe_recalc_groups()
         disc_executor.shutdown(wait=False)
+
+        # Re-probe offline devices for the rest of the run (off the critical path):
+        # any that come online are promoted and start their normal ping cycle.
+        if analyse and control is not None:
+            threading.Thread(target=_offline_monitor, daemon=True).start()
 
         # Drain the analysis pool. bump_completed already fired via callbacks; here
         # we just wait, keep groups fresh, and honour stop/pause.
@@ -3351,6 +3455,21 @@ def scan_subnet(
                 if control:
                     control.wait_if_paused()
                 _maybe_recalc_groups()
+            # Initial online-device work is done (or the scan was stopped): stop the
+            # offline monitor, then drain any promoted cycles it started. Each IP is
+            # promoted at most once, so this is bounded and always terminates.
+            scan_active.clear()
+            while not (control and control.should_exit_task()):
+                with analysis_lock:
+                    pending = [f for f in promoted_futures if not f.done()]
+                if not pending:
+                    break
+                for _ in as_completed(pending):
+                    if control and control.should_exit_task():
+                        break
+                    if control:
+                        control.wait_if_paused()
+                    _maybe_recalc_groups()
             analysis_executor.shutdown(wait=False)
 
     live_table.calculate_groups()

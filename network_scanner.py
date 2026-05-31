@@ -2234,11 +2234,15 @@ class LiveTable:
         phase_prefix = f"   {spinner}   {phi}"
         phase_vis_len = get_visible_len(phase_prefix)
 
-        # Right block: Threads: N  [███] Subnets: ...
+        # Threads sits immediately after the phase prefix (LEFT of the title).
         thr_text = (f"{COLOR_CYAN}Threads: {COLOR_RESET}"
                     f"{COLOR_BRIGHT_WHITE}{format_num(self.active_threads)}{COLOR_RESET}")
         thr_vis = get_visible_len(thr_text)
+        # Left block: spinner + phase + 2 spaces + Threads: N
+        left_block = phase_prefix + "  " + thr_text
+        left_vis = phase_vis_len + 2 + thr_vis
 
+        # Right block: [███] Subnets: ...
         subnets_block = ""
         subnets_vis = 0
         if self.known_network:
@@ -2246,27 +2250,20 @@ class LiveTable:
             subnets_block = kn
             subnets_vis = get_visible_len(kn)
         if self.scanned_subnets:
-            subnets_text = ", ".join(self.scanned_subnets)
-            nets = f"{COLOR_CYAN}Subnets:{COLOR_RESET} {COLOR_BRIGHT_WHITE}{subnets_text}{COLOR_RESET}"
+            nets = f"{COLOR_CYAN}Subnets:{COLOR_RESET} {COLOR_BRIGHT_WHITE}{', '.join(self.scanned_subnets)}{COLOR_RESET}"
             subnets_block += nets
             subnets_vis += get_visible_len(nets)
 
-        # Combine threads + subnets into one right-side block separated by 2 spaces
-        right_block = thr_text
-        right_vis = thr_vis
-        if subnets_block:
-            right_block += "  " + subnets_block
-            right_vis += 2 + subnets_vis
-
-        # Centre the title between the phase prefix and the right block
-        right_limit = self.table_width - right_vis - 2
-        title_start = max(phase_vis_len + 2, (self.table_width - len(title_visible)) // 2)
+        # Centre "Network Scanner" in the space between the left and right blocks.
+        right_limit = self.table_width - subnets_vis - (2 if subnets_vis else 0)
+        title_start = max(left_vis + 2, (self.table_width - len(title_visible)) // 2)
         if title_start + len(title_visible) > right_limit:
-            title_start = max(phase_vis_len + 2, right_limit - len(title_visible))
-        line = phase_prefix + " " * max(0, title_start - phase_vis_len) + title
-        cur = title_start + len(title_visible)
-        gap = max(2, self.table_width - right_vis - cur)
-        line += " " * gap + right_block
+            title_start = max(left_vis + 2, right_limit - len(title_visible))
+        line = left_block + " " * max(0, title_start - left_vis) + title
+        if subnets_block:
+            cur = title_start + len(title_visible)
+            gap = max(2, self.table_width - subnets_vis - cur)
+            line += " " * gap + subnets_block
         output.append(line)
 
         # ── Progress bars (always drawn; at 0 they show an empty outline) ─────
@@ -2550,21 +2547,22 @@ class LiveTable:
             title = "Network Scanner"
             phase_indent = 8
             phase_prefix = " " * phase_indent + phase
-            phase_vis_len = len(phase_prefix)
-
             thr_plain = f"Threads: {format_num(self.active_threads)}"
-            subnets_text = f"Subnets: {', '.join(self.scanned_subnets)}" if self.scanned_subnets else ""
-            right_plain = thr_plain + ("  " + subnets_text if subnets_text else "")
-            right_vis = len(right_plain)
+            left_plain = phase_prefix + "  " + thr_plain
+            left_vis = len(left_plain)
 
-            right_limit = self.table_width - right_vis - 2
-            title_start = max(phase_vis_len + 2, (self.table_width - len(title)) // 2)
+            subnets_text = f"Subnets: {', '.join(self.scanned_subnets)}" if self.scanned_subnets else ""
+            right_vis = len(subnets_text)
+
+            right_limit = self.table_width - right_vis - (2 if subnets_text else 0)
+            title_start = max(left_vis + 2, (self.table_width - len(title)) // 2)
             if title_start + len(title) > right_limit:
-                title_start = max(phase_vis_len + 2, right_limit - len(title))
-            header_line = phase_prefix + " " * max(0, title_start - phase_vis_len) + title
-            cur = title_start + len(title)
-            gap = max(2, self.table_width - right_vis - cur)
-            header_line += " " * gap + right_plain
+                title_start = max(left_vis + 2, right_limit - len(title))
+            header_line = left_plain + " " * max(0, title_start - left_vis) + title
+            if subnets_text:
+                cur = title_start + len(title)
+                gap = max(2, self.table_width - right_vis - cur)
+                header_line += " " * gap + subnets_text
             lines.append(header_line)
 
             # Progress bars (always at 100%)

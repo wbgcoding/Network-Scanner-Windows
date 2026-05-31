@@ -413,6 +413,21 @@ def _center_console_window() -> None:
         pass
 
 
+def _maximize_console(content_cols: int, font_max_height: int) -> None:
+    """Bring the console to its full usable size and centre it.
+
+    Runs the complete sizing sequence in the right order so a restart never
+    leaves a shrunken window (the menu between runs can scroll the buffer and
+    desync the viewport): (1) pick the largest readable font that still fits the
+    content, (2) grow the window to the maximum rows the screen allows at that
+    font (rows=0), and (3) recentre at full work-area height. Safe to call on
+    every scan; a no-op on non-Windows. Font handling is skipped when
+    font_max_height <= 0 (the 'console_font_size = 0' config opt-out)."""
+    _fit_console_font(content_cols + CONSOLE_FONT_FIT_MARGIN, max_height=font_max_height)
+    _resize_terminal(content_cols + CONSOLE_BORDER_MARGIN, rows=0)
+    _center_console_window()
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONSTANTS
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -479,6 +494,16 @@ PROGRESS_BAR_MAX_LEN: int = 46
 PROGRESS_BAR_MARGIN: int = 4
 DEVICE_PROGRESS_BAR_MARGIN: int = 4
 HEADER_INFO_GAP: int = 2   # gap bars→stats and stats→net (kept tight, packed left)
+# Console-window sizing margins (added to TABLE_WIDTH; no magic numbers inline).
+CONSOLE_BORDER_MARGIN: int = 2   # extra cols so the table border never wraps
+CONSOLE_FONT_FIT_MARGIN: int = 4 # cols of slack when choosing the largest font
+# Min gap (cols) the title row keeps between its blocks.
+TITLE_BLOCK_GAP: int = 2
+# Prefix used to label the bar/threads column when measuring the title row.
+PINGS_LABEL: str = "Pings:  "
+# Left indent (cols) of the phase text in the plain-text report header. Matches
+# the visible width of the live view's "   <spinner>   " prefix.
+FILE_HEADER_PHASE_INDENT: int = 8
 
 # ── Column Widths ────────────────────────────────────────────────────────────
 COL_IP_WIDTH: int = 15       # "192.168.100.100" = 15 chars
@@ -660,6 +685,9 @@ DEFAULT_OUTPUT_DIR: str = "./Scans"
 KNOWN_DEVICES_DB_FILE: str = "scanner.db"
 CSV_FILENAME_PREFIX: str = "network_scan_"
 TXT_FILENAME_PREFIX: str = "network_scan_"
+# Marker placed before the gateway's hostname when the network was recognised
+# from the known-devices DB (so a returning network is visible at a glance).
+KNOWN_GATEWAY_HOST_PREFIX: str = "# "
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1746,7 +1774,7 @@ class LiveTable:
         # being shrunk below the content (which would let rows poke past the
         # borders). table_width therefore stays >= TABLE_WIDTH.  rows=0 → the
         # window grows to the FULL screen height that fits at the current font.
-        _resize_terminal(TABLE_WIDTH + 2)
+        _resize_terminal(TABLE_WIDTH + CONSOLE_BORDER_MARGIN)
         self.table_width = TABLE_WIDTH
         # Centre the (now full-height) console window on the primary monitor.
         _center_console_window()
@@ -1794,7 +1822,7 @@ class LiveTable:
         # Widen the console to fit; keep the border (table_width) at the content
         # width even if the console can't grow that far, so rows never poke past
         # the borders (they wrap together instead).
-        _resize_terminal(needed + 2)
+        _resize_terminal(needed + CONSOLE_BORDER_MARGIN)
         with self.lock:
             self.table_width = needed
         # Re-centre: the window just changed width, so its old centred position is
@@ -2239,7 +2267,7 @@ class LiveTable:
         thr_text = (f"{COLOR_CYAN}Threads: {COLOR_RESET}"
                     f"{COLOR_BRIGHT_WHITE}{format_num(self.active_threads)}{COLOR_RESET}")
         thr_len = len(f"Threads: {format_num(self.active_threads)}")
-        bar_end_col = len("Pings:  ") + PROGRESS_BAR_MAX_LEN
+        bar_end_col = len(PINGS_LABEL) + PROGRESS_BAR_MAX_LEN
         thr_start = max(phase_vis + 1, bar_end_col - thr_len)
         left_vis = thr_start + thr_len
 
@@ -2252,15 +2280,15 @@ class LiveTable:
             subnets_vis += get_visible_len(nets)
 
         # Centre "Network Scanner" between the Threads block and the subnets block.
-        right_limit = self.table_width - subnets_vis - (2 if subnets_vis else 0)
-        title_start = max(left_vis + 2, (self.table_width - len(title_visible)) // 2)
+        right_limit = self.table_width - subnets_vis - (TITLE_BLOCK_GAP if subnets_vis else 0)
+        title_start = max(left_vis + TITLE_BLOCK_GAP, (self.table_width - len(title_visible)) // 2)
         if title_start + len(title_visible) > right_limit:
-            title_start = max(left_vis + 2, right_limit - len(title_visible))
+            title_start = max(left_vis + TITLE_BLOCK_GAP, right_limit - len(title_visible))
         line = phase_prefix + " " * max(0, thr_start - phase_vis) + thr_text
         line += " " * max(0, title_start - left_vis) + title
         if subnets_block:
             cur = title_start + len(title_visible)
-            gap = max(2, self.table_width - subnets_vis - cur)
+            gap = max(TITLE_BLOCK_GAP, self.table_width - subnets_vis - cur)
             line += " " * gap + subnets_block
         output.append(line)
 
@@ -2276,7 +2304,7 @@ class LiveTable:
         else:
             ping_center, ping_count_text = "0%", "0/0"
         ping_bar_str = (
-            f"{COLOR_CYAN}Pings:  {COLOR_RESET}"
+            f"{COLOR_CYAN}{PINGS_LABEL}{COLOR_RESET}"
             f"{self._build_ping_bar(pb_len, ping_center)}"
             f" {COLOR_BLUE}{ping_count_text}{COLOR_RESET}"
         )
@@ -2385,6 +2413,10 @@ class LiveTable:
             # Hostname column: real name → magenta; if unknown, fall back to the
             # MAC manufacturer in yellow; otherwise 'Unknown' in gray.
             host, host_kind = resolve_hostname_display(d.hostname, mac)
+            # Mark the gateway's hostname when this network was recognised from
+            # the known-devices DB (request: a "#" before the GW hostname).
+            if self.known_network and self.gateway_ip and d.ip == self.gateway_ip:
+                host = f"{KNOWN_GATEWAY_HOST_PREFIX}{host}"
             host = truncate_host(host, COL_HOSTNAME_WIDTH)
 
             is_local = self.local_ip and d.ip == self.local_ip
@@ -2542,27 +2574,26 @@ class LiveTable:
             elif self.pings_per_device > 0:
                 phase += f" ({format_num(self.pings_per_device)} pings)"
             title = "Network Scanner"
-            phase_indent = 8
-            phase_prefix = " " * phase_indent + phase
+            phase_prefix = " " * FILE_HEADER_PHASE_INDENT + phase
             phase_vis = len(phase_prefix)
             # "Threads: N" right-aligned to the progress-bar end column, just
             # left of the centred title — mirrors the live view.
             thr_plain = f"Threads: {format_num(self.active_threads)}"
-            bar_end_col = len("Pings:  ") + PROGRESS_BAR_MAX_LEN
+            bar_end_col = len(PINGS_LABEL) + PROGRESS_BAR_MAX_LEN
             thr_start = max(phase_vis + 1, bar_end_col - len(thr_plain))
             left_vis = thr_start + len(thr_plain)
             subnets_text = f"Subnets: {', '.join(self.scanned_subnets)}" if self.scanned_subnets else ""
             right_vis = len(subnets_text)
 
-            right_limit = self.table_width - right_vis - (2 if subnets_text else 0)
-            title_start = max(left_vis + 2, (self.table_width - len(title)) // 2)
+            right_limit = self.table_width - right_vis - (TITLE_BLOCK_GAP if subnets_text else 0)
+            title_start = max(left_vis + TITLE_BLOCK_GAP, (self.table_width - len(title)) // 2)
             if title_start + len(title) > right_limit:
-                title_start = max(left_vis + 2, right_limit - len(title))
+                title_start = max(left_vis + TITLE_BLOCK_GAP, right_limit - len(title))
             header_line = phase_prefix + " " * max(0, thr_start - phase_vis) + thr_plain
             header_line += " " * max(0, title_start - left_vis) + title
             if subnets_text:
                 cur = title_start + len(title)
-                gap = max(2, self.table_width - right_vis - cur)
+                gap = max(TITLE_BLOCK_GAP, self.table_width - right_vis - cur)
                 header_line += " " * gap + subnets_text
             lines.append(header_line)
 
@@ -2573,7 +2604,7 @@ class LiveTable:
                 pct = 100.0
                 filled = pb_len
                 pct_text = f"{pct:.0f}%"
-                ping_bar_str = f"Pings:  {self._build_bar(pb_len, filled, pct_text)} {format_num(self.total_pings_completed)}/{format_num(self.total_pings_target)}"
+                ping_bar_str = f"{PINGS_LABEL}{self._build_bar(pb_len, filled, pct_text)} {format_num(self.total_pings_completed)}/{format_num(self.total_pings_target)}"
 
             dev_bar_str = ""
             if self.total_count > 0:
@@ -2644,6 +2675,10 @@ class LiveTable:
                 status = STATUS_ONLINE if online else STATUS_OFFLINE
                 mac = d.mac_address or UNKNOWN_VALUE
                 host, _ = resolve_hostname_display(d.hostname, mac)
+                # Mark the gateway's hostname when the network was recognised
+                # from the known-devices DB — mirrors the live view.
+                if self.known_network and self.gateway_ip and d.ip == self.gateway_ip:
+                    host = f"{KNOWN_GATEWAY_HOST_PREFIX}{host}"
                 # File field is COL_HOSTNAME_WIDTH-1 wide; truncate to fit exactly
                 # so a long name can never shift the following columns.
                 host = truncate_host(host, COL_HOSTNAME_WIDTH - 1)
@@ -3324,10 +3359,12 @@ def main(ping_count: int = DEFAULT_PING_COUNT, high_pressure: bool = False) -> s
     cfg = load_config_manager()
     cfg.print_warnings()       # Show range/type corrections if any
 
-    # Pick the largest readable font at which the table fits, before the live
-    # table sizes the window. Preferred height: [display] console_font_size (0 off).
-    _fit_console_font(TABLE_WIDTH + 4,
-                      max_height=cfg.get_int('console_font_size', CONSOLE_FONT_HEIGHT, 'display'))
+    # Maximize the console (font fit + full-height window + centre) BEFORE the
+    # live table draws. Re-running this on every scan keeps a restart from the
+    # controls menu from leaving a shrunken window. console_font_size = 0 opts
+    # out of font handling.
+    font_max_height = cfg.get_int('console_font_size', CONSOLE_FONT_HEIGHT, 'display')
+    _maximize_console(TABLE_WIDTH, font_max_height)
 
     cfg_ping_count = cfg.get_int('ping_count', DEFAULT_PING_COUNT, 'scanning')
     if ping_count == DEFAULT_PING_COUNT and cfg_ping_count != DEFAULT_PING_COUNT:

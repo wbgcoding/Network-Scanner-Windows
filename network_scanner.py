@@ -2214,8 +2214,14 @@ class LiveTable:
         ipmask_w = max(len(f"IP: {ip_str}"),  len(f"MASK: {mask_str}"))
         gwdns_w  = max(len(f"GW: {gw_str}"),  len(f"DNS: {dns_str}"))
         net_w = ipmask_w + 2 + gwdns_w
-        pings = format_num(self.total_pings_target or self.total_count or 0)
-        count_w = max(len(f"{big}/{big}"), len(f"{pings}/{pings}"))
+        # Match what the bar actually renders: Pings = "<full done>/<short target>"
+        # (denominator abbreviated, e.g. 1M), Devices = "<n>/<n>". Using the full
+        # number for the target here over-grew the window for large ping counts,
+        # making the table wider than the screen could fit (it then wrapped).
+        target = self.total_pings_target or self.total_count or 0
+        pings_full = format_num(target)
+        pings_short = format_num_short(target)
+        count_w = max(len(f"{big}/{big}"), len(f"{pings_full}/{pings_short}"))
         bar_region = len("Devices:") + PROGRESS_BAR_MAX_LEN + 1 + count_w
         return bar_region + HEADER_INFO_GAP + stats_w + HEADER_INFO_GAP + net_w
 

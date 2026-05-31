@@ -2234,14 +2234,6 @@ class LiveTable:
         phase_prefix = f"   {spinner}   {phi}"
         phase_vis_len = get_visible_len(phase_prefix)
 
-        # Threads sits immediately after the phase prefix (LEFT of the title).
-        thr_text = (f"{COLOR_CYAN}Threads: {COLOR_RESET}"
-                    f"{COLOR_BRIGHT_WHITE}{format_num(self.active_threads)}{COLOR_RESET}")
-        thr_vis = get_visible_len(thr_text)
-        # Left block: spinner + phase + 2 spaces + Threads: N
-        left_block = phase_prefix + "  " + thr_text
-        left_vis = phase_vis_len + 2 + thr_vis
-
         # Right block: [███] Subnets: ...
         subnets_block = ""
         subnets_vis = 0
@@ -2254,17 +2246,25 @@ class LiveTable:
             subnets_block += nets
             subnets_vis += get_visible_len(nets)
 
-        # Centre "Network Scanner" in the space between the left and right blocks.
+        # Centre "Network Scanner" between phase prefix (left) and subnets (right).
         right_limit = self.table_width - subnets_vis - (2 if subnets_vis else 0)
-        title_start = max(left_vis + 2, (self.table_width - len(title_visible)) // 2)
+        title_start = max(phase_vis_len + 2, (self.table_width - len(title_visible)) // 2)
         if title_start + len(title_visible) > right_limit:
-            title_start = max(left_vis + 2, right_limit - len(title_visible))
-        line = left_block + " " * max(0, title_start - left_vis) + title
+            title_start = max(phase_vis_len + 2, right_limit - len(title_visible))
+        line = phase_prefix + " " * max(0, title_start - phase_vis_len) + title
         if subnets_block:
             cur = title_start + len(title_visible)
             gap = max(2, self.table_width - subnets_vis - cur)
             line += " " * gap + subnets_block
         output.append(line)
+
+        # Threads: N on its own line, right-aligned to the end of the progress bar
+        # — directly above the Pings bar and to the left of the centred title.
+        bar_end_col = len("Pings:  ") + PROGRESS_BAR_MAX_LEN
+        thr_text = (f"{COLOR_CYAN}Threads: {COLOR_RESET}"
+                    f"{COLOR_BRIGHT_WHITE}{format_num(self.active_threads)}{COLOR_RESET}")
+        thr_lead = max(0, bar_end_col - len(f"Threads: {format_num(self.active_threads)}"))
+        output.append(" " * thr_lead + thr_text)
 
         # ── Progress bars (always drawn; at 0 they show an empty outline) ─────
         pb_len = PROGRESS_BAR_MAX_LEN
@@ -2547,23 +2547,25 @@ class LiveTable:
             title = "Network Scanner"
             phase_indent = 8
             phase_prefix = " " * phase_indent + phase
-            thr_plain = f"Threads: {format_num(self.active_threads)}"
-            left_plain = phase_prefix + "  " + thr_plain
-            left_vis = len(left_plain)
-
+            phase_vis_len = len(phase_prefix)
             subnets_text = f"Subnets: {', '.join(self.scanned_subnets)}" if self.scanned_subnets else ""
             right_vis = len(subnets_text)
 
             right_limit = self.table_width - right_vis - (2 if subnets_text else 0)
-            title_start = max(left_vis + 2, (self.table_width - len(title)) // 2)
+            title_start = max(phase_vis_len + 2, (self.table_width - len(title)) // 2)
             if title_start + len(title) > right_limit:
-                title_start = max(left_vis + 2, right_limit - len(title))
-            header_line = left_plain + " " * max(0, title_start - left_vis) + title
+                title_start = max(phase_vis_len + 2, right_limit - len(title))
+            header_line = phase_prefix + " " * max(0, title_start - phase_vis_len) + title
             if subnets_text:
                 cur = title_start + len(title)
                 gap = max(2, self.table_width - right_vis - cur)
                 header_line += " " * gap + subnets_text
             lines.append(header_line)
+
+            # Threads: N directly above the progress bar, right-aligned to bar end.
+            bar_end_col = len("Pings:  ") + PROGRESS_BAR_MAX_LEN
+            thr_plain = f"Threads: {format_num(self.active_threads)}"
+            lines.append(" " * max(0, bar_end_col - len(thr_plain)) + thr_plain)
 
             # Progress bars (always at 100%)
             ping_bar_str = ""

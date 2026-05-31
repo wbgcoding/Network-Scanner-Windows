@@ -693,6 +693,9 @@ SPINNER_CHARS: str = "@#$%&*+=?!<>()[]{}"
 # ── Live Controls Footer (shown at the bottom while scanning) ────────────────
 CONTROLS_HINT_RUNNING: str = "[P] Pause    [Q] Abbrechen (Ergebnis speichern)    [ESC] Sofort beenden"
 CONTROLS_HINT_PAUSED:  str = "PAUSE  —  [P] weiter    [Q] abbrechen    [ESC] beenden"
+# Shown the instant ESC is pressed so the screen reads as an intentional shutdown
+# (not a freeze) during the brief moment the process tears down. EN + DE.
+CLOSING_MESSAGE: str = "Beende Network Scanner …  /  Closing Network Scanner …"
 
 # ── Phase Numbers ────────────────────────────────────────────────────────────
 PHASE_DISCOVERY: int = 1
@@ -1647,6 +1650,15 @@ def format_num_short(n: int) -> str:
     return str(n)
 
 
+def _done_str(done: int, target: int, infinite: bool = False) -> str:
+    """The 'done' side of a progress count (done/target). Shown in FULL during the
+    scan so every single ping is visible, but ABBREVIATED once finished (done has
+    reached the target) so a completed bar reads cleanly, e.g. '1k/1k'."""
+    if not infinite and target and done >= target:
+        return format_num_short(done)
+    return format_num(done)
+
+
 def format_float(n: float) -> str:
     """Format a ping value: dot thousands separator, comma decimals, 'ms' suffix.
     A whole number drops the ',00' decimals entirely (e.g. 5ms, not 5,00ms)."""
@@ -1903,6 +1915,7 @@ class LiveTable:
         self._refresh_timer = None
         self._refresh_stop = threading.Event()
         self._render_event = threading.Event()  # set by each ping to trigger a redraw
+        self._exiting = False      # set on ESC so no worker thread repaints the table
 
         if platform.system() == "Windows":
             _enable_windows_ansi()
@@ -2465,7 +2478,7 @@ class LiveTable:
             ping_count_text = f"{format_num(done)}/{INFINITE_SYMBOL}"
         elif self.total_pings_target > 0:
             ping_center = f"{done / self.total_pings_target * 100:.0f}%"
-            ping_count_text = f"{format_num(done)}/{format_num_short(self.total_pings_target)}"
+            ping_count_text = f"{_done_str(done, self.total_pings_target)}/{format_num_short(self.total_pings_target)}"
         else:
             ping_center, ping_count_text = "0%", "0/0"
         ping_bar_str = (
@@ -2608,9 +2621,10 @@ class LiveTable:
                 group_text = f"\033[38;5;{color}m███{COLOR_RESET}"
 
             if online:
-                target_disp = (INFINITE_SYMBOL if d.target_pings == PING_COUNT_INFINITE
-                               else format_num_short(d.target_pings))
-                progress_text = f"{COLOR_GREEN}{format_num(d.current_pings)}{COLOR_RESET}/{COLOR_GREEN}{target_disp}{COLOR_RESET}"
+                inf = d.target_pings == PING_COUNT_INFINITE
+                target_disp = INFINITE_SYMBOL if inf else format_num_short(d.target_pings)
+                cur_disp = _done_str(d.current_pings, d.target_pings, infinite=inf)
+                progress_text = f"{COLOR_GREEN}{cur_disp}{COLOR_RESET}/{COLOR_GREEN}{target_disp}{COLOR_RESET}"
             else:
                 progress_text = na
 
@@ -2723,6 +2737,8 @@ class LiveTable:
         sys.stdout.flush()
 
     def _render(self, force: bool = False, clear_first: bool = False):
+        if self._exiting:   # ESC pressed: keep the closing screen, don't repaint
+            return
         if not force:
             now = time.time()
             if now - self.last_render_time < self.render_throttle:
@@ -2781,7 +2797,7 @@ class LiveTable:
                 pct = 100.0
                 filled = pb_len
                 pct_text = f"{pct:.0f}%"
-                ping_bar_str = f"{PINGS_LABEL}{self._build_bar(pb_len, filled, pct_text)} {format_num(self.total_pings_completed)}/{format_num_short(self.total_pings_target)}"
+                ping_bar_str = f"{PINGS_LABEL}{self._build_bar(pb_len, filled, pct_text)} {_done_str(self.total_pings_completed, self.total_pings_target)}/{format_num_short(self.total_pings_target)}"
 
             dev_bar_str = ""
             if self.total_count > 0:
@@ -2861,9 +2877,9 @@ class LiveTable:
                 host = truncate_host(host, COL_HOSTNAME_WIDTH - 1)
 
                 if online:
-                    target_disp = (INFINITE_SYMBOL if d.target_pings == PING_COUNT_INFINITE
-                                   else format_num_short(d.target_pings))
-                    progress = f"{format_num(d.current_pings)}/{target_disp}"
+                    inf = d.target_pings == PING_COUNT_INFINITE
+                    target_disp = INFINITE_SYMBOL if inf else format_num_short(d.target_pings)
+                    progress = f"{_done_str(d.current_pings, d.target_pings, infinite=inf)}/{target_disp}"
                     avg = format_float(d.ping_stats.get('avg')) if d.ping_stats.get('avg') else "N/A"
                     mn  = format_float(d.ping_stats.get('min')) if d.ping_stats.get('min') else "N/A"
                     mx  = format_float(d.ping_stats.get('max')) if d.ping_stats.get('max') else "N/A"
@@ -2921,15 +2937,22 @@ class LiveTable:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _hard_exit_now(lt: "Optional[LiveTable]" = None) -> None:
-    """ESC handler: stop the render thread, reset the terminal and kill the
-    process at once (daemon worker threads die with it)."""
+    """ESC handler: stop repainting, wipe the table and show a short closing
+    message so the screen reads as an intentional shutdown (not a crash) while the
+    process tears down, then kill it at once (daemon worker threads die with it)."""
     try:
         if lt is not None:
+            lt._exiting = True          # stop any worker thread from repainting
             lt.stop_refresh_timer()
     except Exception:
         pass
     try:
-        sys.stdout.write(COLOR_RESET + "\033[?25h\n")  # reset colours, show cursor
+        # Clear the screen + scrollback so the frozen table is gone immediately,
+        # reset colours, show the cursor, and print a centred closing message.
+        width = lt.table_width if lt is not None else TABLE_WIDTH
+        pad = max(0, (width - len(CLOSING_MESSAGE)) // 2)
+        sys.stdout.write("\033[3J\033[2J\033[H" + COLOR_RESET + "\033[?25h"
+                         + "\n" + " " * pad + CLOSING_MESSAGE + "\n")
         sys.stdout.flush()
     except Exception:
         pass

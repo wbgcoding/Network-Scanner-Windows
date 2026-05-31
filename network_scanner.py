@@ -2216,7 +2216,9 @@ class LiveTable:
     def _render_internal_locked(self, clear_first: bool = False):
         output = []
         output.append(f"{COLOR_BLUE}{'=' * self.table_width}{COLOR_RESET}")
-        # Title always centered in table width, phase on the left (indented 8 chars)
+        output.append("")  # one blank line so the title sits one row lower
+
+        # Phase + spinner on the left
         phi = f"{COLOR_CYAN}{self.phase_number}{COLOR_RESET} - {COLOR_BRIGHT_WHITE}{self.current_phase}"
         if self.pings_per_device == PING_COUNT_INFINITE:
             phi += f" ({INFINITE_SYMBOL} pings)"
@@ -2226,16 +2228,17 @@ class LiveTable:
         title_color = random.choice(TITLE_COLORS)
         title = f"\033[1;38;5;{title_color}mNetwork Scanner{COLOR_RESET}"
         title_visible = "Network Scanner"
-        # Loading symbol left of the phase: a random char in a random colour on
-        # every redraw (a glitchy "still working" indicator).
         spin_char = random.choice(SPINNER_CHARS)
         spin_color = random.choice(TITLE_COLORS)
         spinner = f"\033[1;38;5;{spin_color}m{spin_char}{COLOR_RESET}"
         phase_prefix = f"   {spinner}   {phi}"
         phase_vis_len = get_visible_len(phase_prefix)
 
-        # Known-network indicator: coloured ███ in gateway group color shown at
-        # the right of the title line when the DB recognised this network.
+        # Right block: Threads: N  [███] Subnets: ...
+        thr_text = (f"{COLOR_CYAN}Threads: {COLOR_RESET}"
+                    f"{COLOR_BRIGHT_WHITE}{format_num(self.active_threads)}{COLOR_RESET}")
+        thr_vis = get_visible_len(thr_text)
+
         subnets_block = ""
         subnets_vis = 0
         if self.known_network:
@@ -2248,26 +2251,23 @@ class LiveTable:
             subnets_block += nets
             subnets_vis += get_visible_len(nets)
 
-        # Centre the title in the space left between the phase and the right block
-        right_limit = self.table_width - subnets_vis - (2 if subnets_vis else 0)
+        # Combine threads + subnets into one right-side block separated by 2 spaces
+        right_block = thr_text
+        right_vis = thr_vis
+        if subnets_block:
+            right_block += "  " + subnets_block
+            right_vis += 2 + subnets_vis
+
+        # Centre the title between the phase prefix and the right block
+        right_limit = self.table_width - right_vis - 2
         title_start = max(phase_vis_len + 2, (self.table_width - len(title_visible)) // 2)
         if title_start + len(title_visible) > right_limit:
             title_start = max(phase_vis_len + 2, right_limit - len(title_visible))
         line = phase_prefix + " " * max(0, title_start - phase_vis_len) + title
-        if subnets_block:
-            cur = title_start + len(title_visible)
-            gap = max(2, self.table_width - subnets_vis - cur)
-            line += " " * gap + subnets_block
+        cur = title_start + len(title_visible)
+        gap = max(2, self.table_width - right_vis - cur)
+        line += " " * gap + right_block
         output.append(line)
-
-        # ── Threads row, above the bars, right-aligned to the bar's end ───────
-        bar_end_col = len("Pings:  ") + PROGRESS_BAR_MAX_LEN
-        thr_value = format_num(self.active_threads)
-        thr_lead = max(0, bar_end_col - len(f"Threads: {thr_value}"))
-        output.append(
-            " " * thr_lead
-            + f"{COLOR_CYAN}Threads: {COLOR_RESET}{COLOR_BRIGHT_WHITE}{thr_value}{COLOR_RESET}"
-        )
 
         # ── Progress bars (always drawn; at 0 they show an empty outline) ─────
         pb_len = PROGRESS_BAR_MAX_LEN
@@ -2536,10 +2536,12 @@ class LiveTable:
                 """Strip ANSI codes."""
                 return re.sub(r'\033\[[0-9;]*m', '', s)
 
-            # Header separator
+            # Header separator + blank line (title sits one row lower)
             lines.append("=" * self.table_width)
+            lines.append("")
 
-            # Title with phase
+            # Title line: phase on the left, title centred,
+            # "Threads: N  Subnets: ..." on the right — mirrors the live view.
             phase = f"{self.phase_number} - {self.current_phase}"
             if self.pings_per_device == PING_COUNT_INFINITE:
                 phase += f" ({INFINITE_SYMBOL} pings)"
@@ -2549,16 +2551,20 @@ class LiveTable:
             phase_indent = 8
             phase_prefix = " " * phase_indent + phase
             phase_vis_len = len(phase_prefix)
+
+            thr_plain = f"Threads: {format_num(self.active_threads)}"
             subnets_text = f"Subnets: {', '.join(self.scanned_subnets)}" if self.scanned_subnets else ""
-            subnets_vis = len(subnets_text)
-            right_limit = self.table_width - subnets_vis - (2 if subnets_vis else 0)
+            right_plain = thr_plain + ("  " + subnets_text if subnets_text else "")
+            right_vis = len(right_plain)
+
+            right_limit = self.table_width - right_vis - 2
             title_start = max(phase_vis_len + 2, (self.table_width - len(title)) // 2)
             if title_start + len(title) > right_limit:
                 title_start = max(phase_vis_len + 2, right_limit - len(title))
             header_line = phase_prefix + " " * max(0, title_start - phase_vis_len) + title
-            if subnets_text:
-                cur = title_start + len(title)
-                header_line += " " * max(2, self.table_width - subnets_vis - cur) + subnets_text
+            cur = title_start + len(title)
+            gap = max(2, self.table_width - right_vis - cur)
+            header_line += " " * gap + right_plain
             lines.append(header_line)
 
             # Progress bars (always at 100%)
@@ -2604,11 +2610,6 @@ class LiveTable:
             net_r0  = ipmask_r0 + "  " + gwdns_r0
             net_r1  = ipmask_r1 + "  " + gwdns_r1
             stats_w = get_visible_len(stat_r0)
-
-            # Threads row above the bars, right-aligned to the bar's end.
-            bar_end_col = len("Pings:  ") + PROGRESS_BAR_MAX_LEN
-            thr_text = f"Threads: {format_num(self.active_threads)}"
-            lines.append(" " * max(0, bar_end_col - len(thr_text)) + thr_text)
 
             max_bar_len = max(get_visible_len(ping_bar_str), get_visible_len(dev_bar_str)) if (ping_bar_str or dev_bar_str) else 0
             stats_start = max_bar_len + HEADER_INFO_GAP

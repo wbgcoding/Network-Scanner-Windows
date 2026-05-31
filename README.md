@@ -109,11 +109,10 @@ It only ever stores data locally and is git-ignored; nothing leaves your machine
 build_exe.bat
 ```
 
-This builds a one-folder app at `dist\NetworkScanner\` with PyInstaller; run
-`dist\NetworkScanner\NetworkScanner.exe`. One-folder (rather than one-file) means
-there is no temp extraction, so it starts faster and closes instantly on ESC. The
-config and database stay as separate files next to the `.exe` so you can edit them
-without rebuilding.
+This builds a single standalone `dist\NetworkScanner.exe` with PyInstaller. The
+config, the known-devices database and the Scans folder are created next to the
+`.exe` at runtime and stay as separate files so you can edit them without
+rebuilding.
 
 ## Notes
 

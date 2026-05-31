@@ -331,6 +331,54 @@ def _resize_terminal_windows(cols: int, rows: int = 0) -> Tuple[int, int]:
         return (0, 0)
 
 
+def _console_window_metrics() -> Tuple[int, int]:
+    """Return (current_window_cols, max_window_cols) for the Windows console, or
+    (0, 0) when unavailable (non-Windows / redirected). Used to check the window
+    width on every render so it can be kept matched to the table width."""
+    if platform.system() != "Windows":
+        return (0, 0)
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _COORD(ctypes.Structure):
+            _fields_ = [("X", wintypes.SHORT), ("Y", wintypes.SHORT)]
+
+        class _SMALL_RECT(ctypes.Structure):
+            _fields_ = [("Left", wintypes.SHORT), ("Top", wintypes.SHORT),
+                        ("Right", wintypes.SHORT), ("Bottom", wintypes.SHORT)]
+
+        class _CSBI(ctypes.Structure):
+            _fields_ = [("dwSize", _COORD), ("dwCursorPosition", _COORD),
+                        ("wAttributes", wintypes.WORD), ("srWindow", _SMALL_RECT),
+                        ("dwMaximumWindowSize", _COORD)]
+
+        handle = _open_conout()
+        if not handle:
+            return (0, 0)
+        try:
+            csbi = _CSBI()
+            if not ctypes.windll.kernel32.GetConsoleScreenBufferInfo(handle, ctypes.byref(csbi)):
+                return (0, 0)
+            cur = csbi.srWindow.Right - csbi.srWindow.Left + 1
+            return (cur, csbi.dwMaximumWindowSize.X)
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    except Exception:
+        return (0, 0)
+
+
+def _should_resize_window(cur_cols: int, max_cols: int, target_cols: int) -> bool:
+    """Decide whether the console window needs resizing to match the target width.
+    Returns False when the width can't be read (cur_cols == 0). The target is
+    capped at the screen's maximum, so once the window sits at that cap it is left
+    alone (no per-frame resize loop); otherwise any mismatch triggers a resize."""
+    if not cur_cols:
+        return False
+    effective = min(target_cols, max_cols) if max_cols else target_cols
+    return cur_cols != effective
+
+
 def _resize_terminal(cols: int, rows: int = 0) -> Tuple[int, int]:
     """Resize terminal to cols × rows.  rows=0 → max screen height.
     Returns (actual_cols, actual_rows), or (0, 0) when resize is not applicable."""
@@ -2702,17 +2750,25 @@ class LiveTable:
             pad = max(0, (self.table_width - get_visible_len(hint)) // 2)
             output.append(" " * pad + hint)
 
-        # On every update, check the widest output line and the window width; if any
-        # line needs more room than the current table width, grow to fit, resize +
-        # re-centre the console, and rebuild ONCE so this very frame already fits
-        # (no wrap, no flicker). Width only ever grows, never shrinks below TABLE_WIDTH.
+        # On every update: (1) grow the table width to the widest output line so no
+        # line ever wraps, and (2) re-check the actual console window width and
+        # adjust it to match the table width (the window can drift — be too small
+        # or too large — so this keeps it fitted on every frame, not just on
+        # growth). Table width only ever grows, never below TABLE_WIDTH.
         content_w = max((get_visible_len(line) for line in output), default=0)
         needed = max(TABLE_WIDTH, content_w)
-        if needed > self.table_width and not _rebuilding:
+        grew = needed > self.table_width
+        if grew:
             self.table_width = needed
-            _resize_terminal(needed + CONSOLE_BORDER_MARGIN)
+        target_cols = self.table_width + CONSOLE_BORDER_MARGIN
+        cur_cols, max_cols = _console_window_metrics()
+        if grew or _should_resize_window(cur_cols, max_cols, target_cols):
+            _resize_terminal(target_cols)
             _center_console_window()
-            return self._render_internal_locked(clear_first=clear_first, _rebuilding=True)
+            # If the table grew, the output was built at the OLD width — rebuild
+            # once so this very frame is already correct (no wrap, no flicker).
+            if grew and not _rebuilding:
+                return self._render_internal_locked(clear_first=clear_first, _rebuilding=True)
 
         self._write_frame(output, clear_first)
 

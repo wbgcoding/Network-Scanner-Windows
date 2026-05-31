@@ -450,6 +450,15 @@ SUBNET_FIRST_IP: int = 1
 SUBNET_LAST_IP: int = 254   # .255 is the broadcast address — a /24 has 254 usable hosts
 SUBNET_OCTET_COUNT: int = 3
 IP_OCTET_COUNT: int = 4
+# Fallback interface label when auto-detection fails (cosmetic only).
+DEFAULT_INTERFACE_NAME: str = "eth0"
+# Fast local-IP probe: a UDP "connect" to this host:port makes the OS pick the
+# routing source address WITHOUT sending any packet, so we learn our own subnet
+# instantly and the discovery scan can start before the slow PowerShell network
+# query (gateway/DNS/MAC) returns. Any routable address works; nothing is sent.
+LOCAL_IP_PROBE_HOST: str = "8.8.8.8"
+LOCAL_IP_PROBE_PORT: int = 80
+LINK_LOCAL_PREFIX: str = "169.254."
 
 # ── Threading ────────────────────────────────────────────────────────────────
 MAX_WORKERS_INIT: int = 254
@@ -1201,6 +1210,33 @@ def get_ethernet_interface() -> Optional[str]:
     return None
 
 
+def get_local_ip_fast() -> Optional[str]:
+    """Return this machine's primary LAN IPv4 instantly, or None.
+
+    Opens a UDP socket and "connects" it to a routable address: the OS resolves
+    which local interface/source-IP would be used, but because UDP is
+    connectionless no packet is actually transmitted. This is microseconds-fast
+    and avoids the multi-second PowerShell query on the startup critical path, so
+    the discovery scan can begin almost immediately (the full gateway/DNS/MAC
+    details are gathered in the background afterwards)."""
+    s = None
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect((LOCAL_IP_PROBE_HOST, LOCAL_IP_PROBE_PORT))
+        ip = s.getsockname()[0]
+        if ip and ip != "0.0.0.0" and not ip.startswith(LINK_LOCAL_PREFIX):
+            return ip
+    except Exception:
+        return None
+    finally:
+        if s is not None:
+            try:
+                s.close()
+            except Exception:
+                pass
+    return None
+
+
 def get_subnet(ip: str) -> Optional[str]:
     """Extract the subnet from an IP address."""
     if not ip:
@@ -1758,6 +1794,7 @@ class LiveTable:
         self.scanned_subnets: List[str] = []  # CIDRs shown next to the title
         self.active_threads = 0  # Live count of in-flight ping workers
         self.local_ip = None
+        self.local_mac = None
         self.gateway_ip = None
         self.gateway_color = GROUP_GATEWAY_COLOR_DEFAULT
         self.paused = False        # set by the input listener; drives the footer hint
@@ -1866,6 +1903,22 @@ class LiveTable:
     def set_gateway(self, ip: str):
         self.gateway_ip = ip
         self.gateway_color = GROUP_GATEWAY_COLOR_DEFAULT
+
+    def set_local_mac(self, mac: Optional[str]) -> None:
+        """Record this machine's own MAC once it's known (resolved in the
+        background after the fast-start scan has already begun) and back-fill it
+        onto the local device row if that row already exists. The own IP can't be
+        resolved via ARP, so without this the local row would keep showing an
+        unknown MAC. update_device() only ever overwrites a MAC with a genuine
+        value, so a later re-ping won't undo this."""
+        if not mac:
+            return
+        with self.lock:
+            self.local_mac = mac
+            dev = self.devices.get(self.local_ip) if self.local_ip else None
+            if dev and (not dev.mac_address or dev.mac_address == UNKNOWN_VALUE):
+                dev.mac_address = mac
+        self.request_render()
 
     def set_network_info(self, info: Dict):
         """Store network info for display in header."""
@@ -3388,22 +3441,53 @@ def main(ping_count: int = DEFAULT_PING_COUNT, high_pressure: bool = False) -> s
     listener = threading.Thread(target=input_listener, args=(control, live_table), daemon=True)
     listener.start()
 
-    # Network detection (PowerShell — can take a moment on the first run). The
-    # refresh thread keeps redrawing, so the header fills in as soon as it's ready.
-    interface = get_ethernet_interface() or "eth0"
-    network_info = get_network_info(interface)
-    ip = network_info.get('ip')
-
     def _to_prefix(value: str) -> str:
         # "192.168.1.0/24" / "192.168.1.0" / "192.168.1" → "192.168.1"
         base = value.split('/')[0]
         return '.'.join(base.split('.')[:SUBNET_OCTET_COUNT])
 
-    # The auto-detected own subnet is ALWAYS scanned first. Any subnets from the
-    # config (subnet, subnet_2, subnet_3, …) are appended afterwards. Duplicates
-    # are removed while preserving order, so the own subnet stays on top.
-    own_prefix = get_subnet(ip)
     cfg_subnets = [_to_prefix(s) for s in cfg.get_subnets() if _to_prefix(s)]
+    cfg_use_db = cfg.get_bool('known_devices_db', True, 'database')
+    db_path = KNOWN_DEVICES_DB_FILE
+
+    def _preload_known_devices(gw: Optional[str]) -> None:
+        """Pre-load DB devices (listed OFFLINE until a ping succeeds) when the
+        gateway's network is recognised. Thread-safe; runs from either the
+        synchronous fallback or the background resolver."""
+        if not (cfg_use_db and gw):
+            return
+        known_gw_mac = _get_network_mac_from_db(db_path, gw)
+        if not known_gw_mac:
+            return
+        for kd in load_known_devices(db_path, known_gw_mac):
+            with live_table.lock:
+                if kd.ip not in live_table.devices:
+                    live_table.devices[kd.ip] = kd
+        live_table.known_network = True
+        live_table.calculate_groups()   # resolves gateway_color from stored hostname
+
+    # ── Fast start ───────────────────────────────────────────────────────────
+    # Determine our subnet INSTANTLY via a UDP-socket probe so discovery begins
+    # without waiting on the slow PowerShell query (the main cause of the >5 s
+    # cold-start delay). The full network info (gateway/DNS/MAC) and the DB
+    # pre-load then run in the background and fill the header in as they arrive.
+    fast_ip = get_local_ip_fast()
+    fast_start = bool(fast_ip)
+    if fast_start:
+        live_table.set_network_info({'ip': fast_ip})
+    else:
+        # Fallback: the socket probe failed (no route?) — use the slow query.
+        interface = get_ethernet_interface() or DEFAULT_INTERFACE_NAME
+        network_info = get_network_info(interface)
+        fast_ip = network_info.get('ip')
+        live_table.set_network_info(network_info)
+        if network_info.get('gateway'):
+            live_table.set_gateway(network_info['gateway'])
+        live_table.set_local_mac(network_info.get('mac'))
+
+    # The auto-detected own subnet is ALWAYS scanned first. Config subnets follow.
+    # Duplicates are removed while preserving order, so the own subnet stays on top.
+    own_prefix = get_subnet(fast_ip)
     subnet_prefixes, _seen = [], set()
     for p in ([own_prefix] if own_prefix else []) + cfg_subnets:
         if p and p not in _seen:
@@ -3415,39 +3499,34 @@ def main(ping_count: int = DEFAULT_PING_COUNT, high_pressure: bool = False) -> s
         print("Error: Could not determine subnet")
         return 'exit'
 
-    # Subnets being scanned, as CIDR — shown next to the title (request 1)
-    scanned_subnets = [f"{p}.0/24" for p in subnet_prefixes]
-
-    live_table.set_network_info(network_info)
-    live_table.scanned_subnets = scanned_subnets
-    gateway = network_info.get('gateway')
-    if gateway:
-        live_table.set_gateway(gateway)
+    # Subnets being scanned, as CIDR — shown next to the title.
+    live_table.scanned_subnets = [f"{p}.0/24" for p in subnet_prefixes]
 
     # Populate the device count so the full layout (incl. Devices bar) is visible.
     hosts_per_subnet = SUBNET_LAST_IP - SUBNET_FIRST_IP + 1
     live_table.total_count = len(subnet_prefixes) * hosts_per_subnet
 
-    # DB config — resolved once, shared between pre-load and scan_subnet.
-    cfg_use_db = cfg.get_bool('known_devices_db', True, 'database')
-    db_path = KNOWN_DEVICES_DB_FILE
-
-    # Pre-load known devices from DB so they appear as OFFLINE right at startup.
-    # When the scan pings them successfully they transition to ONLINE automatically
-    # via update_device() — no special handling needed in the scan loop.
-    if cfg_use_db and gateway:
-        known_gw_mac = _get_network_mac_from_db(db_path, gateway)
-        if known_gw_mac:
-            for kd in load_known_devices(db_path, known_gw_mac):
-                with live_table.lock:
-                    if kd.ip not in live_table.devices:
-                        live_table.devices[kd.ip] = kd
-            live_table.known_network = True
-            live_table.calculate_groups()   # resolves gateway_color from stored hostname
-
-    # Widen + recentre with the pre-loaded device data already in place.
-    live_table.fit_width()
-    _center_console_window()
+    if fast_start:
+        # Off the critical path: resolve gateway/DNS/MAC + DB pre-load while the
+        # scan is already running. The header and the local row's MAC fill in
+        # as soon as this returns.
+        def _resolve_network_background():
+            interface = get_ethernet_interface() or DEFAULT_INTERFACE_NAME
+            ni = get_network_info(interface)
+            if not ni.get('ip'):
+                ni['ip'] = fast_ip
+            live_table.set_network_info(ni)
+            if ni.get('gateway'):
+                live_table.set_gateway(ni['gateway'])
+            live_table.set_local_mac(ni.get('mac'))
+            _preload_known_devices(ni.get('gateway'))
+            live_table.fit_width()
+            live_table.request_render()
+        threading.Thread(target=_resolve_network_background, daemon=True).start()
+    else:
+        _preload_known_devices(live_table.gateway_ip)
+        live_table.fit_width()
+        _center_console_window()
     live_table._render(force=True, clear_first=True)
 
     # Internet latency: quick pre-fill in the background — never blocks the scan.
@@ -3469,8 +3548,8 @@ def main(ping_count: int = DEFAULT_PING_COUNT, high_pressure: bool = False) -> s
         init_workers=cfg.get_int('init_ping_threads', MAX_WORKERS_INIT, 'scanning') or MAX_WORKERS_INIT,
         control=control,
         live_table_obj=live_table,
-        local_ip=ip,
-        local_mac=network_info.get('mac'),
+        local_ip=fast_ip,
+        local_mac=live_table.local_mac,
         high_pressure=high_pressure,
         internet_hosts=internet_hosts if cfg_enable_inet else [],
         output_dir=output_dir,
@@ -3495,7 +3574,7 @@ def main(ping_count: int = DEFAULT_PING_COUNT, high_pressure: bool = False) -> s
     _last_results_path = None
     if cfg.get_bool('file_output', True, 'output'):
         live_table.set_phase("Save TXT", 0)
-        filename = save_results(live_table, network_info, output_dir)
+        filename = save_results(live_table, live_table.network_info, output_dir)
         _last_results_path = os.path.abspath(filename)
         if cfg.get_bool('export_csv', False, 'output'):
             save_results_csv(live_table, output_dir)

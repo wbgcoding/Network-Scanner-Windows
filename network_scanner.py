@@ -3179,13 +3179,29 @@ def scan_subnet(
 # SAVE RESULTS
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _gw_slug(live_table: "LiveTable") -> str:
+    """Return a filename-safe version of the gateway hostname (max 40 chars).
+    Falls back to the gateway IP, then to an empty string."""
+    host = None
+    if live_table.gateway_ip and live_table.gateway_ip in live_table.devices:
+        h = live_table.devices[live_table.gateway_ip].hostname
+        if h and h != UNKNOWN_VALUE:
+            host = h
+    if not host:
+        host = live_table.gateway_ip or ""
+    # Strip every character that is invalid in Windows/POSIX filenames
+    safe = re.sub(r'[\\/:*?"<>|\s]', '', host)
+    return safe[:40]
+
+
 def save_results(live_table: LiveTable, network_info: Dict, output_dir: str = ".") -> str:
     """Save scan results to a text file."""
-    # Create the output directory (e.g. ./Scans) if it does not exist yet
     if output_dir and output_dir not in (".", "./"):
         os.makedirs(output_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = os.path.join(output_dir, f"{TXT_FILENAME_PREFIX}{timestamp}.txt")
+    gw = _gw_slug(live_table)
+    suffix = f"-{gw}" if gw else ""
+    filename = os.path.join(output_dir, f"{TXT_FILENAME_PREFIX}{timestamp}{suffix}.txt")
 
     lines = [
         "=" * live_table.table_width,
@@ -3239,7 +3255,9 @@ def save_results_csv(live_table: LiveTable, output_dir: str = ".") -> str:
     if output_dir and output_dir not in (".", "./"):
         os.makedirs(output_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = os.path.join(output_dir, f"{CSV_FILENAME_PREFIX}{timestamp}.csv")
+    gw = _gw_slug(live_table)
+    suffix = f"-{gw}" if gw else ""
+    filename = os.path.join(output_dir, f"{CSV_FILENAME_PREFIX}{timestamp}{suffix}.csv")
 
     def _num(v):
         return "" if v is None else f"{v:.2f}"

@@ -1433,14 +1433,13 @@ def get_default_gateway_fast() -> Optional[str]:
         return None
 
 
-def get_local_mac_fast(local_ip: str) -> Optional[str]:
-    """Return THIS machine's MAC for the adapter holding `local_ip`, read directly
-    from the IP Helper API (GetAdaptersInfo). Reliable and instant — unlike the
-    own IP, which can't be resolved via ARP, and unlike parsing ipconfig/getmac
-    which is flaky under load (that left the local row showing 'Unknown').
-    Windows only; returns None elsewhere or on any failure."""
+def _query_local_adapter(local_ip: str):
+    """Return (mac, subnet_mask) for the adapter holding `local_ip`, read directly
+    from the IP Helper API (GetAdaptersInfo). Reliable and instant — the own IP
+    can't be ARP-resolved and parsing ipconfig is flaky under load. Windows only;
+    returns (None, None) elsewhere or on any failure."""
     if platform.system() != "Windows" or not local_ip:
-        return None
+        return (None, None)
     try:
         import ctypes
         from ctypes import wintypes
@@ -1481,10 +1480,10 @@ def get_local_mac_fast(local_ip: str) -> Optional[str]:
         size = wintypes.ULONG(0)
         get_info(None, ctypes.byref(size))           # query required buffer size
         if size.value == 0:
-            return None
+            return (None, None)
         buf = ctypes.create_string_buffer(size.value)
         if get_info(buf, ctypes.byref(size)) != 0:   # 0 = NO_ERROR
-            return None
+            return (None, None)
         adapter = ctypes.cast(buf, ctypes.POINTER(_IP_ADAPTER_INFO))
         while adapter:
             a = adapter.contents
@@ -1493,12 +1492,79 @@ def get_local_mac_fast(local_ip: str) -> Optional[str]:
                 addr = node.contents
                 ip = addr.IpAddress.decode(errors="ignore").strip("\x00").strip()
                 if ip == local_ip and a.AddressLength:
-                    return "-".join(f"{a.Address[i]:02X}" for i in range(a.AddressLength))
+                    mac = "-".join(f"{a.Address[i]:02X}" for i in range(a.AddressLength))
+                    mask = addr.IpMask.decode(errors="ignore").strip("\x00").strip() or None
+                    return (mac, mask)
                 node = addr.Next
             adapter = a.Next
-        return None
+        return (None, None)
     except Exception:
-        return None
+        return (None, None)
+
+
+def get_local_mac_fast(local_ip: str) -> Optional[str]:
+    """This machine's MAC for the adapter holding `local_ip` (IP Helper API)."""
+    return _query_local_adapter(local_ip)[0]
+
+
+def get_subnet_mask_fast(local_ip: str) -> Optional[str]:
+    """This machine's subnet mask for the adapter holding `local_ip` (IP Helper API)."""
+    return _query_local_adapter(local_ip)[1]
+
+
+def get_dns_servers_fast() -> List[str]:
+    """Return the system's configured IPv4 DNS servers via the IP Helper API
+    (GetNetworkParams). Instant and locale-independent, unlike the PowerShell
+    query. Windows only; returns [] elsewhere or on failure."""
+    if platform.system() != "Windows":
+        return []
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _IP_ADDR_STRING(ctypes.Structure):
+            pass
+        _IP_ADDR_STRING._fields_ = [
+            ("Next", ctypes.POINTER(_IP_ADDR_STRING)),
+            ("IpAddress", ctypes.c_char * 16),
+            ("IpMask", ctypes.c_char * 16),
+            ("Context", wintypes.DWORD),
+        ]
+
+        class _FIXED_INFO(ctypes.Structure):
+            _fields_ = [
+                ("HostName", ctypes.c_char * 132),
+                ("DomainName", ctypes.c_char * 132),
+                ("CurrentDnsServer", ctypes.POINTER(_IP_ADDR_STRING)),
+                ("DnsServerList", _IP_ADDR_STRING),
+                ("NodeType", wintypes.UINT),
+                ("ScopeId", ctypes.c_char * 260),
+                ("EnableRouting", wintypes.UINT),
+                ("EnableProxy", wintypes.UINT),
+                ("EnableDns", wintypes.UINT),
+            ]
+
+        get_params = ctypes.windll.iphlpapi.GetNetworkParams
+        size = wintypes.ULONG(0)
+        get_params(None, ctypes.byref(size))
+        if size.value == 0:
+            return []
+        buf = ctypes.create_string_buffer(size.value)
+        if get_params(buf, ctypes.byref(size)) != 0:   # 0 = NO_ERROR
+            return []
+        fixed = ctypes.cast(buf, ctypes.POINTER(_FIXED_INFO)).contents
+        out, seen = [], set()
+        node = ctypes.pointer(fixed.DnsServerList)
+        while node:
+            entry = node.contents
+            ip = entry.IpAddress.decode(errors="ignore").strip("\x00").strip()
+            if ip and ip != "0.0.0.0" and ip not in seen:
+                seen.add(ip)
+                out.append(ip)
+            node = entry.Next
+        return out
+    except Exception:
+        return []
 
 
 def get_subnet(ip: str) -> Optional[str]:
@@ -4120,17 +4186,26 @@ def main(ping_count: int = DEFAULT_PING_COUNT, high_pressure: bool = False) -> s
     fast_ip = get_local_ip_fast()
     fast_start = bool(fast_ip)
     if fast_start:
-        live_table.set_network_info({'ip': fast_ip})
-        # Resolve our own MAC instantly + reliably via the IP Helper API (the own
-        # IP can't be ARP-resolved, and parsing ipconfig later is flaky), so the
-        # local row never shows 'Unknown'.
-        live_table.set_local_mac(get_local_mac_fast(fast_ip))
-        # Resolve the gateway instantly too (IP Helper API) so recognised DB
-        # devices are pre-loaded NOW and get pinged in the first discovery
-        # sweep — not several seconds later when the slow query returns.
+        # Resolve everything instantly + reliably via the IP Helper API (MAC, subnet
+        # mask, gateway, DNS). The own IP can't be ARP-resolved and the PowerShell
+        # query is slow/flaky, which left MAC/MASK/DNS showing 'Unknown'. The
+        # gateway is needed NOW so recognised DB devices pre-load into the first
+        # discovery sweep instead of seconds later.
+        fast_mac, fast_mask = _query_local_adapter(fast_ip)
         fast_gw = get_default_gateway_fast()
+        fast_dns = get_dns_servers_fast()
+        fast_ni = {'ip': fast_ip}
+        if fast_mask:
+            fast_ni['subnet_mask'] = fast_mask
         if fast_gw:
-            live_table.set_network_info({'ip': fast_ip, 'gateway': fast_gw})
+            fast_ni['gateway'] = fast_gw
+        if fast_dns:
+            fast_ni['dns_servers'] = fast_dns
+        if fast_mac:
+            fast_ni['mac'] = fast_mac
+        live_table.set_network_info(fast_ni)
+        live_table.set_local_mac(fast_mac)
+        if fast_gw:
             live_table.set_gateway(fast_gw)
             _preload_known_devices(fast_gw)
     else:
@@ -4171,12 +4246,18 @@ def main(ping_count: int = DEFAULT_PING_COUNT, high_pressure: bool = False) -> s
         def _resolve_network_background():
             interface = get_ethernet_interface() or DEFAULT_INTERFACE_NAME
             ni = get_network_info(interface)
+            prev = dict(live_table.network_info or {})
             if not ni.get('ip'):
                 ni['ip'] = fast_ip
             # Keep the fast-detected gateway if the slow query didn't find one,
             # so the header gateway and the DB lookup stay consistent.
             if not ni.get('gateway') and live_table.gateway_ip:
                 ni['gateway'] = live_table.gateway_ip
+            # Never wipe the instant IP-Helper values when the slow query misses
+            # them (it is flaky) — fall back to what we already showed.
+            for key in ('subnet_mask', 'dns_servers', 'mac'):
+                if not ni.get(key) and prev.get(key):
+                    ni[key] = prev[key]
             live_table.set_network_info(ni)
             if ni.get('gateway'):
                 live_table.set_gateway(ni['gateway'])

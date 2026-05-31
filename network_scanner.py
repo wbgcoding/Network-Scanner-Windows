@@ -2236,10 +2236,6 @@ class LiveTable:
         # Right block: [███] Subnets: ...
         subnets_block = ""
         subnets_vis = 0
-        if self.known_network:
-            kn = f"\033[1;38;5;{self.gateway_color}m###{COLOR_RESET} "
-            subnets_block = kn
-            subnets_vis = get_visible_len(kn)
         if self.scanned_subnets:
             nets = f"{COLOR_CYAN}Subnets:{COLOR_RESET} {COLOR_BRIGHT_WHITE}{', '.join(self.scanned_subnets)}{COLOR_RESET}"
             subnets_block += nets

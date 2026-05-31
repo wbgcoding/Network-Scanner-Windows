@@ -1,10 +1,15 @@
 @echo off
 REM ============================================================================
-REM  build_exe.bat — build the Network Scanner into a single standalone .exe.
+REM  build_exe.bat — build the Network Scanner as a ONE-FOLDER app.
+REM
+REM  One-folder (--onedir) instead of one-file: the .exe runs straight from the
+REM  dist\NetworkScanner folder with NO temp extraction, so it starts faster and
+REM  — most importantly — closes INSTANTLY on ESC (a one-file build has to delete
+REM  its extracted _MEI temp dir on exit, which made ESC feel like a crash).
 REM
 REM  The config (network_scanner.conf) and the known-devices database
-REM  (known_devices.db) are NOT bundled — they stay as external files next to
-REM  the .exe so they can be edited without rebuilding.
+REM  (scanner.db) are NOT bundled — they stay as external files next to the .exe
+REM  so they can be edited without rebuilding.
 REM
 REM  PyInstaller notes:
 REM   --collect-binaries _sqlite3  : bundles _sqlite3.pyd (Windows C extension)
@@ -43,9 +48,9 @@ if exist "build"          rmdir /s /q "build"
 if exist "dist"           rmdir /s /q "dist"
 if exist "%APPNAME%.spec" del /q "%APPNAME%.spec"
 
-echo  [4/4] Building %APPNAME%.exe ...
+echo  [4/4] Building %APPNAME% (one-folder) ...
 python -m PyInstaller ^
-    --onefile --console --clean --noconfirm ^
+    --onedir --console --clean --noconfirm ^
     --name "%APPNAME%" ^
     --collect-all sqlite3 ^
     --collect-binaries _sqlite3 ^
@@ -60,16 +65,18 @@ if errorlevel 1 (
     exit /b 1
 )
 
-REM Drop the template config next to the .exe if no config exists there yet.
+REM Drop the template config next to the .exe (inside the app folder) if no
+REM config exists there yet.
 if exist "network_scanner.conf.template" (
-    if not exist "dist\network_scanner.conf" (
-        copy /y "network_scanner.conf.template" "dist\network_scanner.conf" >nul
+    if not exist "dist\%APPNAME%\network_scanner.conf" (
+        copy /y "network_scanner.conf.template" "dist\%APPNAME%\network_scanner.conf" >nul
     )
 )
 
 echo.
 echo  ============================================================
-echo   Done:  %~dp0dist\%APPNAME%.exe
+echo   Done:  %~dp0dist\%APPNAME%\%APPNAME%.exe
+echo   Run the .exe inside the dist\%APPNAME% folder. Closes instantly on ESC.
 echo   Put network_scanner.conf next to the .exe to configure it.
 echo  ============================================================
 echo.

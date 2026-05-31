@@ -1,80 +1,100 @@
 # ===============================================================================
-# Network Scanner -- configuration file
-# This file is used as-is when no network_scanner.conf exists.
-# Copy it to network_scanner.conf to customise your setup.
-# Lines starting with # or ; are ignored. Out-of-range values are auto-corrected.
+#  Network Scanner - configuration
+# -------------------------------------------------------------------------------
+#  Every setting below is OPTIONAL and shown with its default. The scanner runs
+#  fine with no config at all - it just uses these defaults.
+#
+#  To change something: copy this file to "network_scanner.conf", then uncomment
+#  a line (remove the leading #) and set your value.
+#  Lines starting with # or ; are ignored. Out-of-range values are auto-corrected.
 # ===============================================================================
 
-# -- THREADS -------------------------------------------------------------------
-# init_ping_threads  Threads during discovery phase. 0 = one per IP.
-#   Range: 0-1000 | Default: 254
-#init_ping_threads = 254
 
-# ping_threads  Threads during analysis phase.
-#   Range: 1-1000 | Default: 100
-#ping_threads = 100
+# -- NETWORK -------------------------------------------------------------------
 
-# -- PING ----------------------------------------------------------------------
-# init_ping_count  Pings per device during discovery.
-#   Range: 1-100 | Default: 1
-#init_ping_count = 1
+# subnet  Network to scan, in CIDR notation. Leave unset to auto-detect the
+#   subnet of this PC. Example: 192.168.1.0/24
+#subnet = 192.168.1.0/24
 
-# ping_count  Pings per device during analysis.
+# subnet_2, subnet_3, ...  Extra subnets to scan in the same run, in order.
+#subnet_2 = 10.0.0.0/24
+#subnet_3 = 172.16.0.0/24
+
+# pinned_ips  Always ping these IPs every scan and pin them to the TOP of the
+#   list - even when they are offline. Comma-separated. Handy for your router,
+#   NAS, server, printer... Default: none.
+#pinned_ips = 192.168.2.1, 192.168.2.10
+
+
+# -- PING BEHAVIOUR ------------------------------------------------------------
+
+# ping_count  How many times each device is pinged (you can also pick this from
+#   the start menu). Internet hosts are pinged the same number of times.
 #   Range: 1-10000000 | Default: 10
 #ping_count = 10
 
-# ping_interval_ms  Pause between two pings to the SAME host (ms).
-#   Keeps fast LAN hosts from racing to 100%. Range: 0-10000 | Default: 100
+# ping_interval_ms  Pause between two pings to the SAME host, in milliseconds.
+#   Stops fast LAN hosts from finishing instantly. Range: 0-10000 | Default: 100
 #ping_interval_ms = 100
 
-# refresh_rate  Minimum seconds between screen redraws.
-#   Range: 0.1-60.0 | Default: 1.0
-#refresh_rate = 1.0
+# init_ping_count  Pings per device during the quick discovery sweep.
+#   Range: 1-100 | Default: 1
+#init_ping_count = 1
 
-# console_font_size  Console font height in pixels (0 = leave untouched).
-#   Range: 0-72 | Default: 18
-#console_font_size = 18
-
-# -- NETWORK -------------------------------------------------------------------
-# subnet  Target subnet in CIDR notation. Leave empty for auto-detection.
-#   Example: 192.168.1.0/24
-#subnet = 192.168.1.0/24
-
-# Additional subnets scanned in the same run, in order.
-#subnet_2 = 10.0.0.0/24
-#subnet_3 = 172.16.0.0/24
-#subnet_4 = 192.168.2.0/24
-
-# -- HIGH PRESSURE MODE --------------------------------------------------------
-# high_pressure_mode  Ping all devices at once with several subthreads each.
-#   true  = maximum throughput (high CPU/network load)
-#   false = pipelined scan (discovery + analysis)  | Default: false
+# high_pressure_mode  Ping every device at once with several threads each.
+#   true  = maximum speed (high CPU / network load)
+#   false = smooth pipelined scan (discovery, then analysis). Default: false
 #high_pressure_mode = false
 
+
+# -- INTERNET LATENCY ----------------------------------------------------------
+
+# enable_internet_ping  Also ping a few public hosts to compare LAN vs internet
+#   latency. Default: true
+#enable_internet_ping = true
+
+# internet_hosts  Public IPs to measure against. Comma-separated.
+#   Default: 8.8.8.8, 8.8.4.4, 1.1.1.1, 9.9.9.9
+#internet_hosts = 8.8.8.8, 8.8.4.4, 1.1.1.1, 9.9.9.9
+
+
+# -- KNOWN-DEVICES DATABASE ----------------------------------------------------
+
+# known_devices_db  Remember devices per network in scanner.db. On a later scan
+#   the same network's devices are listed again (offline until they answer), so
+#   you instantly see what is missing. Default: true
+#known_devices_db = true
+
+
 # -- OUTPUT --------------------------------------------------------------------
-# output_directory  Folder for scan results (created automatically).
+
+# output_directory  Where scan reports are saved (created automatically).
 #   Default: ./Scans
 #output_directory = ./Scans
 
-# file_output  Write a plain-text report after the scan.
-#   Default: true
+# file_output  Write a plain-text report after each scan. Default: true
 #file_output = true
 
-# export_csv  Also write a machine-readable CSV file next to the report.
-#   Default: false
+# export_csv  Also write a CSV file next to the report. Default: false
 #export_csv = false
 
-# -- KNOWN-DEVICES DATABASE ----------------------------------------------------
-# known_devices_db  Store devices per network in scanner.db. The DB is updated
-#   after each scan and pre-loaded at startup so known devices appear offline
-#   immediately, switching to online as pings succeed. | Default: true
-#known_devices_db = true
 
-# -- INTERNET PING -------------------------------------------------------------
-# enable_internet_ping  Ping external hosts to measure internet latency.
-#   Default: true
-#enable_internet_ping = true
+# -- PERFORMANCE ---------------------------------------------------------------
 
-# internet_hosts  Comma-separated list of IPv4 addresses.
-#   Default: 8.8.8.8, 8.8.4.4, 1.1.1.1, 9.9.9.9
-#internet_hosts = 8.8.8.8, 8.8.4.4, 1.1.1.1, 9.9.9.9
+# ping_threads  Worker threads during the analysis phase.
+#   Range: 1-1000 | Default: 100
+#ping_threads = 100
+
+# init_ping_threads  Worker threads during discovery. 0 = one per IP.
+#   Range: 0-1000 | Default: 254
+#init_ping_threads = 254
+
+
+# -- DISPLAY -------------------------------------------------------------------
+
+# refresh_rate  Minimum seconds between screen redraws. Range: 0.1-60.0 | Default: 1.0
+#refresh_rate = 1.0
+
+# console_font_size  Console font height in pixels (0 = leave the font untouched).
+#   Range: 0-72 | Default: 18
+#console_font_size = 18

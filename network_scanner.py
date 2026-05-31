@@ -757,6 +757,13 @@ STATUS_ONLINE: str = "ONLINE"
 STATUS_OFFLINE: str = "OFFLINE"
 STATUS_UNKNOWN: str = "UNKNOWN"
 INFINITE_SYMBOL: str = "∞"
+# The ∞ symbol drawn in the unlimited-mode purple (for the live view only — the
+# saved report stays plain text and uses INFINITE_SYMBOL directly).
+INFINITE_DISPLAY: str = f"{COLOR_PURPLE}{INFINITE_SYMBOL}{COLOR_RESET}"
+# Markers placed just left of a value (1-space gap) in each ping column: a red
+# block on the highest (slowest) value, a green block on the lowest (fastest).
+PING_MARK_HIGH: str = "\033[91m█\033[0m "   # red block + gap
+PING_MARK_LOW:  str = "\033[92m█\033[0m "   # green block + gap
 
 # ── Output ───────────────────────────────────────────────────────────────────
 DEFAULT_OUTPUT_DIR: str = "./Scans"
@@ -784,6 +791,14 @@ _CONF_RANGES: Dict[str, Tuple] = {
     'refresh_rate':      (0.1, 60.0),
     'console_font_size': (0, 72),   # 0 = leave the console font untouched
 }
+
+
+def _is_ipv4(text: str) -> bool:
+    """True for a well-formed dotted IPv4 address (four 0-255 octets)."""
+    parts = text.split('.')
+    if len(parts) != IP_OCTET_COUNT:
+        return False
+    return all(p.isdigit() and 0 <= int(p) <= 255 for p in parts)
 
 
 class ConfigManager:
@@ -855,14 +870,14 @@ class ConfigManager:
         try:
             val = int(str(raw).strip())
         except (ValueError, TypeError):
-            self._warnings.append(f"  {key}: '{raw}' ist keine ganze Zahl → Standardwert {fallback}")
+            self._warnings.append(f"  {key}: '{raw}' is not a whole number -> using default {fallback}")
             return fallback
         if key in _CONF_RANGES:
             lo, hi = _CONF_RANGES[key]
             if not (lo <= val <= hi):
                 clamped = max(lo, min(hi, val))
                 self._warnings.append(
-                    f"  {key}: {val} außerhalb [{lo}, {hi}] → korrigiert zu {clamped}"
+                    f"  {key}: {val} out of range [{lo}, {hi}] -> corrected to {clamped}"
                 )
                 return clamped
         return val
@@ -874,7 +889,7 @@ class ConfigManager:
         try:
             val = float(str(raw).strip().replace(',', '.'))
         except (ValueError, AttributeError):
-            self._warnings.append(f"  {key}: '{raw}' ist keine Zahl → Standardwert {fallback}")
+            self._warnings.append(f"  {key}: '{raw}' is not a number -> using default {fallback}")
             return fallback
         if key in _CONF_RANGES:
             lo, hi = _CONF_RANGES[key]
@@ -916,9 +931,23 @@ class ConfigManager:
                 result.append(v)
         return result
 
+    def get_ip_list(self, key: str, section: str = None) -> List[str]:
+        """Parse a comma/semicolon-separated list of IPv4 addresses (order kept,
+        duplicates and invalid entries dropped). Empty when unset."""
+        raw = self.get(key, None, section)
+        if not raw:
+            return []
+        out, seen = [], set()
+        for part in str(raw).replace(';', ',').split(','):
+            ip = part.strip()
+            if ip and ip not in seen and _is_ipv4(ip):
+                seen.add(ip)
+                out.append(ip)
+        return out
+
     def print_warnings(self) -> None:
         if self._warnings:
-            print(f"\n{COLOR_YELLOW}Konfigurations-Warnungen:{COLOR_RESET}")
+            print(f"\n{COLOR_YELLOW}Configuration warnings:{COLOR_RESET}")
             for w in self._warnings:
                 print(w)
 
@@ -947,85 +976,105 @@ def load_config_manager() -> ConfigManager:
 # commented out, so a fresh config runs entirely on the built-in defaults.
 _CONF_TEMPLATE_CONTENT = """\
 # ===============================================================================
-# Network Scanner -- configuration file
-# This file is used as-is when no network_scanner.conf exists.
-# Copy it to network_scanner.conf to customise your setup.
-# Lines starting with # or ; are ignored. Out-of-range values are auto-corrected.
+#  Network Scanner - configuration
+# -------------------------------------------------------------------------------
+#  Every setting below is OPTIONAL and shown with its default. The scanner runs
+#  fine with no config at all - it just uses these defaults.
+#
+#  To change something: copy this file to "network_scanner.conf", then uncomment
+#  a line (remove the leading #) and set your value.
+#  Lines starting with # or ; are ignored. Out-of-range values are auto-corrected.
 # ===============================================================================
 
-# -- THREADS -------------------------------------------------------------------
-# init_ping_threads  Threads during discovery phase. 0 = one per IP.
-#   Range: 0-1000 | Default: 254
-#init_ping_threads = 254
 
-# ping_threads  Threads during analysis phase.
-#   Range: 1-1000 | Default: 100
-#ping_threads = 100
+# -- NETWORK -------------------------------------------------------------------
 
-# -- PING ----------------------------------------------------------------------
-# init_ping_count  Pings per device during discovery.
-#   Range: 1-100 | Default: 1
-#init_ping_count = 1
+# subnet  Network to scan, in CIDR notation. Leave unset to auto-detect the
+#   subnet of this PC. Example: 192.168.1.0/24
+#subnet = 192.168.1.0/24
 
-# ping_count  Pings per device during analysis.
+# subnet_2, subnet_3, ...  Extra subnets to scan in the same run, in order.
+#subnet_2 = 10.0.0.0/24
+#subnet_3 = 172.16.0.0/24
+
+# pinned_ips  Always ping these IPs every scan and pin them to the TOP of the
+#   list - even when they are offline. Comma-separated. Handy for your router,
+#   NAS, server, printer... Default: none.
+#pinned_ips = 192.168.2.1, 192.168.2.10
+
+
+# -- PING BEHAVIOUR ------------------------------------------------------------
+
+# ping_count  How many times each device is pinged (you can also pick this from
+#   the start menu). Internet hosts are pinged the same number of times.
 #   Range: 1-10000000 | Default: 10
 #ping_count = 10
 
-# ping_interval_ms  Pause between two pings to the SAME host (ms).
-#   Keeps fast LAN hosts from racing to 100%. Range: 0-10000 | Default: 100
+# ping_interval_ms  Pause between two pings to the SAME host, in milliseconds.
+#   Stops fast LAN hosts from finishing instantly. Range: 0-10000 | Default: 100
 #ping_interval_ms = 100
 
-# refresh_rate  Minimum seconds between screen redraws.
-#   Range: 0.1-60.0 | Default: 1.0
-#refresh_rate = 1.0
+# init_ping_count  Pings per device during the quick discovery sweep.
+#   Range: 1-100 | Default: 1
+#init_ping_count = 1
 
-# console_font_size  Console font height in pixels (0 = leave untouched).
-#   Range: 0-72 | Default: 18
-#console_font_size = 18
-
-# -- NETWORK -------------------------------------------------------------------
-# subnet  Target subnet in CIDR notation. Leave empty for auto-detection.
-#   Example: 192.168.1.0/24
-#subnet = 192.168.1.0/24
-
-# Additional subnets scanned in the same run, in order.
-#subnet_2 = 10.0.0.0/24
-#subnet_3 = 172.16.0.0/24
-#subnet_4 = 192.168.2.0/24
-
-# -- HIGH PRESSURE MODE --------------------------------------------------------
-# high_pressure_mode  Ping all devices at once with several subthreads each.
-#   true  = maximum throughput (high CPU/network load)
-#   false = pipelined scan (discovery + analysis)  | Default: false
+# high_pressure_mode  Ping every device at once with several threads each.
+#   true  = maximum speed (high CPU / network load)
+#   false = smooth pipelined scan (discovery, then analysis). Default: false
 #high_pressure_mode = false
 
+
+# -- INTERNET LATENCY ----------------------------------------------------------
+
+# enable_internet_ping  Also ping a few public hosts to compare LAN vs internet
+#   latency. Default: true
+#enable_internet_ping = true
+
+# internet_hosts  Public IPs to measure against. Comma-separated.
+#   Default: 8.8.8.8, 8.8.4.4, 1.1.1.1, 9.9.9.9
+#internet_hosts = 8.8.8.8, 8.8.4.4, 1.1.1.1, 9.9.9.9
+
+
+# -- KNOWN-DEVICES DATABASE ----------------------------------------------------
+
+# known_devices_db  Remember devices per network in scanner.db. On a later scan
+#   the same network's devices are listed again (offline until they answer), so
+#   you instantly see what is missing. Default: true
+#known_devices_db = true
+
+
 # -- OUTPUT --------------------------------------------------------------------
-# output_directory  Folder for scan results (created automatically).
+
+# output_directory  Where scan reports are saved (created automatically).
 #   Default: ./Scans
 #output_directory = ./Scans
 
-# file_output  Write a plain-text report after the scan.
-#   Default: true
+# file_output  Write a plain-text report after each scan. Default: true
 #file_output = true
 
-# export_csv  Also write a machine-readable CSV file next to the report.
-#   Default: false
+# export_csv  Also write a CSV file next to the report. Default: false
 #export_csv = false
 
-# -- KNOWN-DEVICES DATABASE ----------------------------------------------------
-# known_devices_db  Store devices per network in scanner.db. The DB is updated
-#   after each scan and pre-loaded at startup so known devices appear offline
-#   immediately, switching to online as pings succeed. | Default: true
-#known_devices_db = true
 
-# -- INTERNET PING -------------------------------------------------------------
-# enable_internet_ping  Ping external hosts to measure internet latency.
-#   Default: true
-#enable_internet_ping = true
+# -- PERFORMANCE ---------------------------------------------------------------
 
-# internet_hosts  Comma-separated list of IPv4 addresses.
-#   Default: 8.8.8.8, 8.8.4.4, 1.1.1.1, 9.9.9.9
-#internet_hosts = 8.8.8.8, 8.8.4.4, 1.1.1.1, 9.9.9.9
+# ping_threads  Worker threads during the analysis phase.
+#   Range: 1-1000 | Default: 100
+#ping_threads = 100
+
+# init_ping_threads  Worker threads during discovery. 0 = one per IP.
+#   Range: 0-1000 | Default: 254
+#init_ping_threads = 254
+
+
+# -- DISPLAY -------------------------------------------------------------------
+
+# refresh_rate  Minimum seconds between screen redraws. Range: 0.1-60.0 | Default: 1.0
+#refresh_rate = 1.0
+
+# console_font_size  Console font height in pixels (0 = leave the font untouched).
+#   Range: 0-72 | Default: 18
+#console_font_size = 18
 """
 
 
@@ -1685,17 +1734,32 @@ def format_num(n: int) -> str:
 
 
 def format_num_short(n: int) -> str:
-    """Abbreviate a large MAX/target value for the progress bars: 1000 -> '1k',
-    1500 -> '1,5k', 1000000 -> '1M'. Values below 1000 are returned unchanged so
-    they stay exact. Only used for the bar's denominator (the ceiling); the actual
-    running count keeps format_num() so every single ping is still shown in full."""
+    """Abbreviate a large MAX/target value for the progress bars with NO decimals:
+    1000 -> '1k', 12345 -> '12k', 1000000 -> '1M', 1300000 -> '1M'. Values below
+    1000 are returned unchanged so they stay exact. Only used for the bar's
+    denominator (the ceiling); the running count keeps format_num() so every single
+    ping is still shown in full while the scan runs."""
     n = int(n)
     for divisor, suffix in ((1_000_000_000, 'B'), (1_000_000, 'M'), (1_000, 'k')):
         if abs(n) >= divisor:
-            value = n / divisor
-            text = f"{value:.1f}".rstrip('0').rstrip('.')  # 1.0 -> '1', 1.5 -> '1.5'
-            return f"{text}{suffix}".replace('.', ',')      # German decimal comma
+            return f"{n // divisor}{suffix}"   # integer only, no decimal places
     return str(n)
+
+
+def _value_extremes(pairs):
+    """Given an iterable of (key, value) pairs, return (key_of_highest,
+    key_of_lowest). Returns (None, None) when there are fewer than two values or
+    all values are equal — in those cases there is no meaningful highest/lowest to
+    mark. Used to put a red block on the slowest and a green block on the fastest
+    value in each ping column; recomputed every render so the marks move live."""
+    vals = [(k, v) for k, v in pairs if v is not None]
+    if len(vals) < 2:
+        return (None, None)
+    hi = max(vals, key=lambda p: p[1])
+    lo = min(vals, key=lambda p: p[1])
+    if hi[1] == lo[1]:
+        return (None, None)
+    return (hi[0], lo[0])
 
 
 def _done_str(done: int, target: int, infinite: bool = False) -> str:
@@ -1952,6 +2016,7 @@ class LiveTable:
         self.public_latencies = {}
         self.network_info = {}  # Set via set_network_info()
         self.scanned_subnets: List[str] = []  # CIDRs shown next to the title
+        self.pinned_ips: List[str] = []        # always pinged + pinned to list top
         self.active_threads = 0  # Live count of in-flight ping workers
         self.local_ip = None
         self.local_mac = None
@@ -2064,6 +2129,17 @@ class LiveTable:
     def set_gateway(self, ip: str):
         self.gateway_ip = ip
         self.gateway_color = GROUP_GATEWAY_COLOR_DEFAULT
+
+    def set_pinned_ips(self, ips: List[str]) -> None:
+        """Register always-ping IPs that are pinned to the top of the list and
+        shown even when offline. Adds an offline placeholder row for each so they
+        appear immediately, before the first ping."""
+        with self.lock:
+            self.pinned_ips = list(ips)
+            for ip in self.pinned_ips:
+                if ip not in self.devices:
+                    self.devices[ip] = Device(ip=ip, ping_status=False, is_offline=True)
+        self.request_render()
 
     def set_local_mac(self, mac: Optional[str]) -> None:
         """Record this machine's own MAC once it's known (resolved in the
@@ -2285,49 +2361,49 @@ class LiveTable:
         self.request_render()
 
     @staticmethod
-    def _overlay_center(chars: List[str], center_text: str, pb_len: int) -> str:
-        """Overlay center_text (bold white) onto the middle of a bar's cell list
-        and join it into a single string. Used by every progress bar so a bar at
-        0% still shows its '0%'/∞ label on the empty outline."""
+    def _overlay_center(chars: List[str], center_text: str, pb_len: int,
+                        color: str = COLOR_BOLD + COLOR_WHITE) -> str:
+        """Overlay center_text onto the middle of a bar's cell list and join it into
+        a single string. `color` defaults to bold white; the ∞ label is drawn in the
+        unlimited-mode purple. Used by every progress bar so a bar at 0% still shows
+        its '0%'/∞ label on the empty outline."""
         start = (pb_len - len(center_text)) // 2
         for i, ch in enumerate(center_text):
             pos = start + i
             if 0 <= pos < pb_len:
-                chars[pos] = f"{COLOR_BOLD}{COLOR_WHITE}{ch}{COLOR_RESET}"
+                chars[pos] = f"{color}{ch}{COLOR_RESET}"
         return "".join(chars)
 
-    def _build_ping_bar(self, pb_len: int, center_text: str) -> str:
+    def _build_ping_bar(self, pb_len: int, center_text: str,
+                        center_color: str = COLOR_BOLD + COLOR_WHITE) -> str:
         """Coloured ping progress bar:
           green  █ = successful pings
-          red    █ = failed pings
-          gray   █ = skipped (offline discovery / 5-fail rule)
+          red    █ = every ping that got no answer (failed + skipped/offline)
           dark   ░ = not yet attempted
         """
         total = self.total_pings_target
         if total <= 0:
             # No target yet (startup) or ∞ mode → empty outline, label still shown.
             chars = [f"{COLOR_DARK_GRAY}░{COLOR_RESET}"] * pb_len
-            return self._overlay_center(chars, center_text, pb_len)
+            return self._overlay_center(chars, center_text, pb_len, center_color)
 
         def _blocks(count: int) -> int:
             return max(0, round(pb_len * count / total))
 
         s = _blocks(self.ping_success)
-        f = _blocks(self.ping_failed)
-        k = _blocks(self.ping_skipped)
+        # Every ping without a reply is red — failed AND skipped (offline / 5-fail).
+        f = _blocks(self.ping_failed + self.ping_skipped)
         # Clamp so rounding never pushes us past pb_len
         s = min(s, pb_len)
         f = min(f, pb_len - s)
-        k = min(k, pb_len - s - f)
-        r = pb_len - s - f - k
+        r = pb_len - s - f
 
         chars = (
             [f"\033[92m█{COLOR_RESET}"] * s +        # bright green  — success
-            [f"\033[91m█{COLOR_RESET}"] * f +        # bright red    — failed
-            [f"\033[90m█{COLOR_RESET}"] * k +        # dark gray blk — skipped
+            [f"\033[91m█{COLOR_RESET}"] * f +        # bright red    — no answer
             [f"{COLOR_DARK_GRAY}░{COLOR_RESET}"] * r # outline       — remaining
         )
-        return self._overlay_center(chars, center_text, pb_len)
+        return self._overlay_center(chars, center_text, pb_len, center_color)
 
     def set_phase(self, ph: str, pi: int):
         with self.lock:
@@ -2521,9 +2597,11 @@ class LiveTable:
         # ── Progress bars (always drawn; at 0 they show an empty outline) ─────
         pb_len = PROGRESS_BAR_MAX_LEN
         done = self.ping_success + self.ping_failed + self.ping_skipped
+        ping_center_color = COLOR_BOLD + COLOR_WHITE
         if self.is_infinite:
             ping_center = INFINITE_SYMBOL
-            ping_count_text = f"{format_num(done)}/{INFINITE_SYMBOL}"
+            ping_center_color = COLOR_PURPLE                 # ∞ in the unlimited purple
+            ping_count_text = f"{format_num(done)}/{INFINITE_DISPLAY}"
         elif self.total_pings_target > 0:
             ping_center = f"{done / self.total_pings_target * 100:.0f}%"
             ping_count_text = f"{_done_str(done, self.total_pings_target)}/{format_num_short(self.total_pings_target)}"
@@ -2531,7 +2609,7 @@ class LiveTable:
             ping_center, ping_count_text = "0%", "0/0"
         ping_bar_str = (
             f"{COLOR_CYAN}{PINGS_LABEL}{COLOR_RESET}"
-            f"{self._build_ping_bar(pb_len, ping_center)}"
+            f"{self._build_ping_bar(pb_len, ping_center, ping_center_color)}"
             f" {COLOR_BLUE}{ping_count_text}{COLOR_RESET}"
         )
 
@@ -2610,15 +2688,37 @@ class LiveTable:
         output.append("".join(headers))
         output.append(f"{COLOR_BLUE}{'-' * self.table_width}{COLOR_RESET}")
 
+        pinned_order = {ip: i for i, ip in enumerate(self.pinned_ips)}
+
         def _ip_sort_key(x: str):
             parts = x.split('.')
-            return tuple(int(p) for p in parts) if len(parts) == IP_OCTET_COUNT and all(p.isdigit() for p in parts) else (999, 0, 0, 0)
+            ip_key = tuple(int(p) for p in parts) if len(parts) == IP_OCTET_COUNT and all(p.isdigit() for p in parts) else (999, 0, 0, 0)
+            # Pinned IPs always sort to the very top, in their configured order.
+            if x in pinned_order:
+                return (0, pinned_order[x], (0, 0, 0, 0))
+            return (1, 0, ip_key)
+        # Per-column extremes among online devices: a red block marks the highest
+        # (slowest) value and a green block the lowest (fastest) in each column.
+        # Recomputed every render, so the marks follow the values dynamically.
+        online_devs = [(dip, dv) for dip, dv in self.devices.items() if dv.ping_status]
+        avg_hi, avg_lo = _value_extremes((dip, dv.ping_stats.get('avg')) for dip, dv in online_devs)
+        min_hi, min_lo = _value_extremes((dip, dv.ping_stats.get('min')) for dip, dv in online_devs)
+        max_hi, max_lo = _value_extremes((dip, dv.ping_stats.get('max')) for dip, dv in online_devs)
+        last_hi, last_lo = _value_extremes((dip, dv.last_ping) for dip, dv in online_devs)
+
+        def _mark(dip, hi, lo):
+            if dip == hi:
+                return PING_MARK_HIGH
+            if dip == lo:
+                return PING_MARK_LOW
+            return ""
+
         sorted_ips = sorted(self.devices.keys(), key=_ip_sort_key)
         for ip in sorted_ips:
             d = self.devices[ip]
             # Show devices that responded this scan, plus known devices loaded from
-            # the DB (these are listed even while offline).
-            if not d.ping_status and not d.from_db:
+            # the DB and pinned IPs (these are listed even while offline).
+            if not d.ping_status and not d.from_db and ip not in pinned_order:
                 continue
             online = d.ping_status
             status = STATUS_ONLINE if online else STATUS_OFFLINE
@@ -2627,11 +2727,11 @@ class LiveTable:
                 ac, ar = colorize_ping(d.ping_stats.get('avg'))
                 mc, mr = colorize_ping(d.ping_stats.get('max')) if d.ping_stats.get('max') else (COLOR_WHITE, COLOR_RESET)
                 nc, nr = colorize_ping(d.ping_stats.get('min')) if d.ping_stats.get('min') else (COLOR_WHITE, COLOR_RESET)
-                avg_text = f"{ac}{format_float(d.ping_stats.get('avg'))}{ar}" if d.ping_stats.get('avg') else na
-                max_text = f"{mc}{format_float(d.ping_stats.get('max'))}{mr}" if d.ping_stats.get('max') else na
-                min_text = f"{nc}{format_float(d.ping_stats.get('min'))}{nr}" if d.ping_stats.get('min') else na
+                avg_text = f"{_mark(ip, avg_hi, avg_lo)}{ac}{format_float(d.ping_stats.get('avg'))}{ar}" if d.ping_stats.get('avg') else na
+                max_text = f"{_mark(ip, max_hi, max_lo)}{mc}{format_float(d.ping_stats.get('max'))}{mr}" if d.ping_stats.get('max') else na
+                min_text = f"{_mark(ip, min_hi, min_lo)}{nc}{format_float(d.ping_stats.get('min'))}{nr}" if d.ping_stats.get('min') else na
                 lc, lr = colorize_ping(d.last_ping) if d.last_ping is not None else (COLOR_WHITE, COLOR_RESET)
-                last_text = f"{lc}{format_float(d.last_ping)}{lr}" if d.last_ping is not None else na
+                last_text = f"{_mark(ip, last_hi, last_lo)}{lc}{format_float(d.last_ping)}{lr}" if d.last_ping is not None else na
             else:
                 avg_text = min_text = max_text = last_text = na
 
@@ -2670,9 +2770,9 @@ class LiveTable:
 
             if online:
                 inf = d.target_pings == PING_COUNT_INFINITE
-                target_disp = INFINITE_SYMBOL if inf else format_num_short(d.target_pings)
+                target_disp = INFINITE_DISPLAY if inf else f"{COLOR_GREEN}{format_num_short(d.target_pings)}{COLOR_RESET}"
                 cur_disp = _done_str(d.current_pings, d.target_pings, infinite=inf)
-                progress_text = f"{COLOR_GREEN}{cur_disp}{COLOR_RESET}/{COLOR_GREEN}{target_disp}{COLOR_RESET}"
+                progress_text = f"{COLOR_GREEN}{cur_disp}{COLOR_RESET}/{target_disp}"
             else:
                 progress_text = na
 
@@ -2909,16 +3009,22 @@ class LiveTable:
             )
             lines.append("-" * self.table_width)
 
-            # Device rows — online devices plus known (DB) devices, even offline.
+            # Device rows — online devices plus known (DB) and pinned devices,
+            # even offline. Pinned IPs are listed first, in configured order.
+            pinned_order = {pip: i for i, pip in enumerate(self.pinned_ips)}
+
             def _ip_sort_key(x: str):
                 parts = x.split('.')
-                return (tuple(int(p) for p in parts)
-                        if len(parts) == IP_OCTET_COUNT and all(p.isdigit() for p in parts)
-                        else (999, 0, 0, 0))
+                ip_key = (tuple(int(p) for p in parts)
+                          if len(parts) == IP_OCTET_COUNT and all(p.isdigit() for p in parts)
+                          else (999, 0, 0, 0))
+                if x in pinned_order:
+                    return (0, pinned_order[x], (0, 0, 0, 0))
+                return (1, 0, ip_key)
             sorted_ips = sorted(self.devices.keys(), key=_ip_sort_key)
             for ip in sorted_ips:
                 d = self.devices[ip]
-                if not d.ping_status and not d.from_db:
+                if not d.ping_status and not d.from_db and ip not in pinned_order:
                     continue
                 online = d.ping_status
                 status = STATUS_ONLINE if online else STATUS_OFFLINE
@@ -3146,7 +3252,19 @@ def _resolve_device_identity(ip: str, dev: Device, lt: "Optional[LiveTable]", sy
         if need_mac and nb_mac:
             dev.mac_address = nb_mac
     if lt:
-        lt.update_device(dev)
+        # Patch ONLY the identity fields on the live entry. This thread can finish
+        # seconds late (slow reverse DNS); calling the full update_device() would
+        # write back this dev's stale current_pings/target_pings (= the single
+        # discovery ping) and clobber the running analysis — making a device look
+        # like it was "pinged only once". So never touch the ping counters here.
+        with lt.lock:
+            entry = lt.devices.get(ip)
+            if entry is not None:
+                if dev.mac_address and dev.mac_address != UNKNOWN_VALUE:
+                    entry.mac_address = dev.mac_address
+                if dev.hostname and dev.hostname != UNKNOWN_VALUE:
+                    entry.hostname = dev.hostname
+        lt.request_render()
 
 
 def ping_host_multiple(
@@ -3277,18 +3395,18 @@ def ping_internet_hosts(live_table: LiveTable, hosts: List[str],
                         interval_ms: int = PING_INTERVAL_MS,
                         ctrl: "Optional[ScannerControl]" = None):
     """Ping internet hosts in parallel and update latency. Each host gets its own
-    thread. ∞ scans fall back to a fixed sample so this still terminates. Honours
-    pause/stop so these threads halt together with the device-ping threads."""
-    if count == PING_COUNT_INFINITE:
-        count = INITIAL_INTERNET_PING_COUNT
+    thread and is pinged the SAME number of times as the local devices (the count
+    chosen in the controls, including ∞ = run until stopped). Latency updates live
+    after every reply. Honours pause/stop so these threads halt with the rest."""
+    infinite = count == PING_COUNT_INFINITE
     interval_s = max(0, interval_ms) / 1000.0
 
     def _ping_one(host: str):
         system = platform.system()
         lats: List[float] = []
         succ = 0
-
-        for n in range(count):
+        i = 0
+        while infinite or i < count:
             if ctrl and ctrl.should_exit_task():
                 break
             if ctrl:
@@ -3300,18 +3418,17 @@ def ping_internet_hosts(live_table: LiveTable, hosts: List[str],
                 if success and latency is not None:
                     lats.append(latency)
                     succ += 1
+                    live_table.set_public_latency(host, {
+                        'min': min(lats),
+                        'max': max(lats),
+                        'avg': sum(lats) / len(lats),
+                        'count': succ
+                    })
             except Exception:
                 pass
-            if interval_s and n + 1 < count:
+            i += 1
+            if interval_s and (infinite or i < count):
                 _interruptible_sleep(interval_s, ctrl)
-
-        if lats:
-            live_table.set_public_latency(host, {
-                'min': min(lats),
-                'max': max(lats),
-                'avg': sum(lats) / len(lats),
-                'count': succ
-            })
 
     threads = [threading.Thread(target=_ping_one, args=(h,), daemon=True) for h in hosts]
     for t in threads:
@@ -3411,8 +3528,15 @@ def scan_subnet(
     subnets = [subnet] if isinstance(subnet, str) else list(subnet)
     ip_range = [f"{sn}.{i}" for sn in subnets
                 for i in range(SUBNET_FIRST_IP, SUBNET_LAST_IP + 1)]
-    # Known/DB-recognised devices are already in the table at this point — ping
-    # them first so they don't wait their numeric turn behind many offline IPs.
+    # Pinned IPs are pinged every run even when they fall outside the scanned
+    # subnets — add any that aren't already covered.
+    seen_ips = set(ip_range)
+    for pip in live_table.pinned_ips:
+        if pip not in seen_ips:
+            ip_range.append(pip)
+            seen_ips.add(pip)
+    # Known/DB-recognised + pinned devices are already in the table at this point —
+    # ping them first so they don't wait their numeric turn behind many offline IPs.
     with live_table.lock:
         known_ips = set(live_table.devices.keys())
     ip_range = _prioritize_known_ips(ip_range, known_ips)
@@ -3436,7 +3560,9 @@ def scan_subnet(
     # discovery pass, so it has no discovery pings to count.
     _internet_hosts = internet_hosts if internet_hosts else []
     analysis_per_ip = 0 if (ping_count <= 0 or infinite) else ping_count
-    internet_count = INITIAL_INTERNET_PING_COUNT if infinite else ping_count
+    # Internet hosts are pinged as often as the local devices (same control value,
+    # including ∞). The startup prefill already gave a quick initial reading.
+    internet_count = ping_count
     discovery_pings = 0 if high_pressure else len(ip_range) * DISCOVERY_PING_COUNT
     analysis_pings = len(ip_range) * analysis_per_ip
     internet_pings = len(_internet_hosts) * max(0, internet_count)
@@ -3809,6 +3935,10 @@ def main(ping_count: int = DEFAULT_PING_COUNT, high_pressure: bool = False) -> s
     cfg_subnets = [_to_prefix(s) for s in cfg.get_subnets() if _to_prefix(s)]
     cfg_use_db = cfg.get_bool('known_devices_db', True, 'database')
     db_path = KNOWN_DEVICES_DB_FILE
+
+    # Pinned IPs: always pinged every run and pinned to the top of the list (shown
+    # even when offline). Registering them now adds their placeholder rows.
+    live_table.set_pinned_ips(cfg.get_ip_list('pinned_ips'))
 
     def _preload_known_devices(gw: Optional[str]) -> None:
         """Pre-load DB devices (listed OFFLINE until a ping succeeds) when the

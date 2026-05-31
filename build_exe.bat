@@ -51,6 +51,7 @@ echo  [4/4] Building %APPNAME%.exe (single file) ...
 python -m PyInstaller ^
     --onefile --console --clean --noconfirm ^
     --name "%APPNAME%" ^
+    --icon "network.ico" ^
     --collect-all sqlite3 ^
     --collect-binaries _sqlite3 ^
     --hidden-import _sqlite3 ^

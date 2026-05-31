@@ -484,6 +484,10 @@ UNIX_PING_TIMEOUT_S: int = 1
 # a high ping_count races to 100% on fast LAN hosts; this paces each host so a
 # run takes a sensible amount of time. Overridable via [scanning] ping_interval_ms.
 PING_INTERVAL_MS: int = 100
+# Granularity for pause/stop-aware waits. The inter-ping interval is sliced into
+# chunks this small so pressing P (pause) or Q/ESC (stop) takes effect within
+# this many seconds instead of waiting out the full ping_interval_ms.
+PAUSE_POLL_INTERVAL_S: float = 0.05
 RENDER_THROTTLE_SECONDS: float = 1.0
 # Minimum gap between live redraws. Each ping wakes the render thread, but bursts
 # from many worker threads are coalesced to at most one redraw per this interval
@@ -1045,6 +1049,27 @@ class ScannerControl:
     def should_exit_task(self) -> bool:
         with self.lock:
             return self.stop_requested or self.shutdown
+
+
+def _interruptible_sleep(seconds: float, ctrl: "Optional[ScannerControl]" = None) -> None:
+    """Sleep up to `seconds`, but wake the instant a pause or stop is requested so
+    controls take effect immediately instead of waiting out the ping interval.
+    Falls back to a plain sleep when no control is attached."""
+    if seconds <= 0:
+        return
+    if ctrl is None:
+        time.sleep(seconds)
+        return
+    end = time.monotonic() + seconds
+    while True:
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            return
+        # Pause: stop sleeping now; the caller's loop blocks on wait_if_paused().
+        # Stop: stop sleeping now; the caller's loop sees should_exit_task().
+        if ctrl.paused or ctrl.should_exit_task():
+            return
+        time.sleep(min(PAUSE_POLL_INTERVAL_S, remaining))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3077,17 +3102,21 @@ def _ping_loop(ip, count, lt, ctrl, local_ip, local_mac, dev, lats, system,
 
         i += 1
         # Pace consecutive pings to the same host (no wait after the last ping).
+        # Interruptible so pressing pause/stop takes effect at once instead of
+        # waiting out the full interval before the loop re-checks the controls.
         if interval_s and (infinite or i < count):
-            time.sleep(interval_s)
+            _interruptible_sleep(interval_s, ctrl)
 
     return dev
 
 
 def ping_internet_hosts(live_table: LiveTable, hosts: List[str],
                         count: int = DEFAULT_PING_COUNT,
-                        interval_ms: int = PING_INTERVAL_MS):
+                        interval_ms: int = PING_INTERVAL_MS,
+                        ctrl: "Optional[ScannerControl]" = None):
     """Ping internet hosts in parallel and update latency. Each host gets its own
-    thread. ∞ scans fall back to a fixed sample so this still terminates."""
+    thread. ∞ scans fall back to a fixed sample so this still terminates. Honours
+    pause/stop so these threads halt together with the device-ping threads."""
     if count == PING_COUNT_INFINITE:
         count = INITIAL_INTERNET_PING_COUNT
     interval_s = max(0, interval_ms) / 1000.0
@@ -3098,6 +3127,12 @@ def ping_internet_hosts(live_table: LiveTable, hosts: List[str],
         succ = 0
 
         for n in range(count):
+            if ctrl and ctrl.should_exit_task():
+                break
+            if ctrl:
+                ctrl.wait_if_paused()
+                if ctrl.should_exit_task():
+                    break
             try:
                 success, latency = measure_ping(host, system)
                 if success and latency is not None:
@@ -3106,7 +3141,7 @@ def ping_internet_hosts(live_table: LiveTable, hosts: List[str],
             except Exception:
                 pass
             if interval_s and n + 1 < count:
-                time.sleep(interval_s)
+                _interruptible_sleep(interval_s, ctrl)
 
         if lats:
             live_table.set_public_latency(host, {
@@ -3123,10 +3158,11 @@ def ping_internet_hosts(live_table: LiveTable, hosts: List[str],
         t.join()
 
 
-def prefill_internet_latency(live_table: LiveTable, hosts: List[str]) -> None:
+def prefill_internet_latency(live_table: LiveTable, hosts: List[str],
+                             ctrl: "Optional[ScannerControl]" = None) -> None:
     """Quick parallel pre-fill of internet latencies so the header shows values
     early. Runs in the background so it never blocks the layout or the scan."""
-    ping_internet_hosts(live_table, hosts, INITIAL_INTERNET_PING_COUNT)
+    ping_internet_hosts(live_table, hosts, INITIAL_INTERNET_PING_COUNT, ctrl=ctrl)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3166,6 +3202,19 @@ def _merge_known_devices(live_table: "LiveTable", db_path: str, gateway_mac: str
             live_table.devices[kd.ip] = kd
 
 
+def _prioritize_known_ips(ip_range: List[str], known_ips: "set") -> List[str]:
+    """Move IPs that are already known (pre-loaded from the DB) to the front of the
+    discovery queue so their pings start in the very first sweep instead of waiting
+    behind dozens of offline IPs — each of which can burn a full ping timeout — when
+    the worker pool is smaller than the address range. Order within each group is
+    preserved, so the numeric sweep is otherwise unchanged."""
+    if not known_ips:
+        return ip_range
+    prioritized = [ip for ip in ip_range if ip in known_ips]
+    rest = [ip for ip in ip_range if ip not in known_ips]
+    return prioritized + rest
+
+
 def scan_subnet(
     subnet: str,
     ping_count: int = DEFAULT_PING_COUNT,
@@ -3191,6 +3240,11 @@ def scan_subnet(
     subnets = [subnet] if isinstance(subnet, str) else list(subnet)
     ip_range = [f"{sn}.{i}" for sn in subnets
                 for i in range(SUBNET_FIRST_IP, SUBNET_LAST_IP + 1)]
+    # Known/DB-recognised devices are already in the table at this point — ping
+    # them first so they don't wait their numeric turn behind many offline IPs.
+    with live_table.lock:
+        known_ips = set(live_table.devices.keys())
+    ip_range = _prioritize_known_ips(ip_range, known_ips)
     live_table.total_count = len(ip_range)
 
     infinite = ping_count == PING_COUNT_INFINITE
@@ -3229,7 +3283,7 @@ def scan_subnet(
     if _internet_hosts and ping_count != 0:
         threading.Thread(
             target=ping_internet_hosts,
-            args=(live_table, _internet_hosts, internet_count, interval_ms),
+            args=(live_table, _internet_hosts, internet_count, interval_ms, control),
             daemon=True
         ).start()
 
@@ -3606,7 +3660,7 @@ def main(ping_count: int = DEFAULT_PING_COUNT, high_pressure: bool = False) -> s
         raw_hosts = cfg.get_str('internet_hosts', '', 'internet')
         internet_hosts = [h.strip() for h in raw_hosts.split(',') if h.strip()] if raw_hosts else INTERNET_PING_HOSTS
         threading.Thread(
-            target=prefill_internet_latency, args=(live_table, internet_hosts), daemon=True
+            target=prefill_internet_latency, args=(live_table, internet_hosts, control), daemon=True
         ).start()
     else:
         internet_hosts = []

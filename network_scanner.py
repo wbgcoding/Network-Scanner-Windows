@@ -413,17 +413,28 @@ def _center_console_window() -> None:
         pass
 
 
+# Set once the font has been fitted, so a restart from the controls menu does
+# NOT re-fit it. Re-fitting can land on a different size (the console's
+# buffer/screen metrics differ after a scan), which would visibly change the
+# font and the window. The resize/centre below are idempotent at a fixed font,
+# so they may run every time without altering an already-stable window.
+_console_font_fitted: bool = False
+
+
 def _maximize_console(content_cols: int, font_max_height: int) -> None:
     """Bring the console to its full usable size and centre it.
 
-    Runs the complete sizing sequence in the right order so a restart never
-    leaves a shrunken window (the menu between runs can scroll the buffer and
-    desync the viewport): (1) pick the largest readable font that still fits the
-    content, (2) grow the window to the maximum rows the screen allows at that
-    font (rows=0), and (3) recentre at full work-area height. Safe to call on
-    every scan; a no-op on non-Windows. Font handling is skipped when
+    Order matters so a restart never leaves a shrunken window (the menu between
+    runs can scroll the buffer and desync the viewport): (1) once, pick the
+    largest readable font that still fits the content; (2) grow the window to the
+    maximum rows the screen allows at that font (rows=0); (3) recentre at full
+    work-area height. The font is fitted only on the first run so restarts keep a
+    stable font/size. A no-op on non-Windows; font handling is skipped when
     font_max_height <= 0 (the 'console_font_size = 0' config opt-out)."""
-    _fit_console_font(content_cols + CONSOLE_FONT_FIT_MARGIN, max_height=font_max_height)
+    global _console_font_fitted
+    if not _console_font_fitted:
+        _fit_console_font(content_cols + CONSOLE_FONT_FIT_MARGIN, max_height=font_max_height)
+        _console_font_fitted = True
     _resize_terminal(content_cols + CONSOLE_BORDER_MARGIN, rows=0)
     _center_console_window()
 
@@ -1235,6 +1246,51 @@ def get_local_ip_fast() -> Optional[str]:
             except Exception:
                 pass
     return None
+
+
+class _MIB_IPFORWARDROW(ctypes.Structure):
+    # Win32 routing-table row (iphlpapi). Only dwForwardNextHop is read here.
+    _fields_ = [("dwForwardDest", ctypes.c_uint32),
+                ("dwForwardMask", ctypes.c_uint32),
+                ("dwForwardPolicy", ctypes.c_uint32),
+                ("dwForwardNextHop", ctypes.c_uint32),
+                ("dwForwardIfIndex", ctypes.c_uint32),
+                ("dwForwardType", ctypes.c_uint32),
+                ("dwForwardProto", ctypes.c_uint32),
+                ("dwForwardAge", ctypes.c_uint32),
+                ("dwForwardNextHopAS", ctypes.c_uint32),
+                ("dwForwardMetric1", ctypes.c_uint32),
+                ("dwForwardMetric2", ctypes.c_uint32),
+                ("dwForwardMetric3", ctypes.c_uint32),
+                ("dwForwardMetric4", ctypes.c_uint32),
+                ("dwForwardMetric5", ctypes.c_uint32)]
+
+
+def get_default_gateway_fast() -> Optional[str]:
+    """Return the default-gateway IPv4 instantly via the IP Helper API, or None.
+
+    Uses iphlpapi!GetBestRoute to the probe host — the routing layer returns the
+    next hop (the gateway) without any network round-trip. This lets the
+    known-devices DB be looked up and pre-loaded at startup (DB devices need the
+    gateway IP) WITHOUT waiting on the slow PowerShell query, so recognised
+    devices appear and start pinging at the same time as freshly-discovered ones.
+    Windows only; returns None elsewhere or on any failure."""
+    if platform.system() != "Windows":
+        return None
+    try:
+        octets = [int(x) for x in LOCAL_IP_PROBE_HOST.split('.')]
+        if len(octets) != IP_OCTET_COUNT:
+            return None
+        # Network-byte-order address packed as a little-endian DWORD (Windows LE).
+        dest = octets[0] | (octets[1] << 8) | (octets[2] << 16) | (octets[3] << 24)
+        row = _MIB_IPFORWARDROW()
+        if ctypes.windll.iphlpapi.GetBestRoute(dest, 0, ctypes.byref(row)) != 0:
+            return None
+        nh = row.dwForwardNextHop
+        gw = f"{nh & 0xFF}.{(nh >> 8) & 0xFF}.{(nh >> 16) & 0xFF}.{(nh >> 24) & 0xFF}"
+        return gw if gw != "0.0.0.0" else None
+    except Exception:
+        return None
 
 
 def get_subnet(ip: str) -> Optional[str]:
@@ -3475,6 +3531,14 @@ def main(ping_count: int = DEFAULT_PING_COUNT, high_pressure: bool = False) -> s
     fast_start = bool(fast_ip)
     if fast_start:
         live_table.set_network_info({'ip': fast_ip})
+        # Resolve the gateway instantly too (IP Helper API) so recognised DB
+        # devices are pre-loaded NOW and get pinged in the first discovery
+        # sweep — not several seconds later when the slow query returns.
+        fast_gw = get_default_gateway_fast()
+        if fast_gw:
+            live_table.set_network_info({'ip': fast_ip, 'gateway': fast_gw})
+            live_table.set_gateway(fast_gw)
+            _preload_known_devices(fast_gw)
     else:
         # Fallback: the socket probe failed (no route?) — use the slow query.
         interface = get_ethernet_interface() or DEFAULT_INTERFACE_NAME
@@ -3515,11 +3579,18 @@ def main(ping_count: int = DEFAULT_PING_COUNT, high_pressure: bool = False) -> s
             ni = get_network_info(interface)
             if not ni.get('ip'):
                 ni['ip'] = fast_ip
+            # Keep the fast-detected gateway if the slow query didn't find one,
+            # so the header gateway and the DB lookup stay consistent.
+            if not ni.get('gateway') and live_table.gateway_ip:
+                ni['gateway'] = live_table.gateway_ip
             live_table.set_network_info(ni)
             if ni.get('gateway'):
                 live_table.set_gateway(ni['gateway'])
             live_table.set_local_mac(ni.get('mac'))
+            # Pre-load now if the fast gateway lookup didn't already (idempotent);
+            # always recalc groups so the gateway colour reflects the real host.
             _preload_known_devices(ni.get('gateway'))
+            live_table.calculate_groups()
             live_table.fit_width()
             live_table.request_render()
         threading.Thread(target=_resolve_network_background, daemon=True).start()

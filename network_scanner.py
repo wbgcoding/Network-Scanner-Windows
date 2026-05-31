@@ -537,6 +537,10 @@ UNIX_PING_TIMEOUT_S: int = 1
 # a high ping_count races to 100% on fast LAN hosts; this paces each host so a
 # run takes a sensible amount of time. Overridable via [scanning] ping_interval_ms.
 PING_INTERVAL_MS: int = 100
+# Live +/- adjustment of the inter-ping interval during a scan (footer control).
+PING_INTERVAL_STEP_MS: int = 100   # each +/- press changes it by this much
+PING_INTERVAL_MIN_MS: int = 0      # 0 = no pause (fastest)
+PING_INTERVAL_MAX_MS: int = 10_000
 # Granularity for pause/stop-aware waits. The inter-ping interval is sliced into
 # chunks this small so pressing P (pause) or Q/ESC (stop) takes effect within
 # this many seconds instead of waiting out the full ping_interval_ms.
@@ -2099,6 +2103,7 @@ class LiveTable:
         self.paused = False        # set by the input listener; drives the footer hint
         self.is_infinite = False   # ∞ mode: pings run until the user stops the scan
         self.offline_after_failures = ANALYSIS_MAX_CONSECUTIVE_FAILURES  # misses → offline
+        self.ping_interval_ms = PING_INTERVAL_MS   # live pause between pings (+/- in footer)
         self.known_network = False # True when the DB recognised this network's gateway
         self._refresh_timer = None
         self._refresh_stop = threading.Event()
@@ -2230,6 +2235,15 @@ class LiveTable:
             dev = self.devices.get(self.local_ip) if self.local_ip else None
             if dev and (not dev.mac_address or dev.mac_address == UNKNOWN_VALUE):
                 dev.mac_address = mac
+        self.request_render()
+
+    def adjust_ping_interval(self, delta_ms: int) -> None:
+        """Live-adjust the pause between pings (the footer +/- control), clamped to
+        [PING_INTERVAL_MIN_MS, PING_INTERVAL_MAX_MS]. Running ping loops read this
+        value each cycle, so the change takes effect immediately."""
+        with self.lock:
+            self.ping_interval_ms = max(PING_INTERVAL_MIN_MS,
+                                        min(PING_INTERVAL_MAX_MS, self.ping_interval_ms + delta_ms))
         self.request_render()
 
     def mark_offline(self, ip: str) -> None:
@@ -2956,10 +2970,16 @@ class LiveTable:
         # Controls hint footer — only while actively scanning. Turns yellow and
         # shows the resume wording while paused.
         if self.phase_number in (PHASE_DISCOVERY, PHASE_ANALYSIS):
+            base = COLOR_YELLOW if self.paused else COLOR_DARK_GRAY
+            # Live +/- timeout control, shown just left of the ESC entry. The
+            # current value is highlighted and updates on every +/- press.
+            timeout_ctrl = f"[+/-] Timeout: {COLOR_BRIGHT_WHITE}{self.ping_interval_ms}ms{base}"
             if self.paused:
-                hint = f"{COLOR_YELLOW}{CONTROLS_HINT_PAUSED}{COLOR_RESET}"
+                parts = ["PAUSE  —  [P] weiter", "[Q] abbrechen", timeout_ctrl, "[ESC] beenden"]
             else:
-                hint = f"{COLOR_DARK_GRAY}{CONTROLS_HINT_RUNNING}{COLOR_RESET}"
+                parts = ["[P] Pause", "[Q] Abbrechen (Ergebnis speichern)",
+                         timeout_ctrl, "[ESC] Sofort beenden"]
+            hint = f"{base}{'    '.join(parts)}{COLOR_RESET}"
             pad = max(0, (self.table_width - get_visible_len(hint)) // 2)
             output.append(" " * pad + hint)
 
@@ -3249,6 +3269,14 @@ def _handle_scan_key(ch: str, control: ScannerControl, lt: "Optional[LiveTable]"
     if ch == 'q':                       # graceful stop → show end screen
         control.request_stop()
         return True
+    if ch in ('+', '='):                # raise the inter-ping interval (+100ms)
+        if lt is not None:
+            lt.adjust_ping_interval(PING_INTERVAL_STEP_MS)
+        return False
+    if ch == '-':                       # lower the inter-ping interval (-100ms)
+        if lt is not None:
+            lt.adjust_ping_interval(-PING_INTERVAL_STEP_MS)
+        return False
     return False
 
 
@@ -3424,7 +3452,6 @@ def _ping_loop(ip, count, lt, ctrl, local_ip, local_mac, dev, lats, system,
     succ = 0
     consecutive_failures = 0
     infinite = count == PING_COUNT_INFINITE
-    interval_s = max(0, interval_ms) / 1000.0
     i = 0
     while infinite or i < count:
         if ctrl and ctrl.should_exit_task():
@@ -3506,10 +3533,12 @@ def _ping_loop(ip, count, lt, ctrl, local_ip, local_mac, dev, lats, system,
 
         i += 1
         # Pace consecutive pings to the same host (no wait after the last ping).
-        # Interruptible so pressing pause/stop takes effect at once instead of
-        # waiting out the full interval before the loop re-checks the controls.
-        if interval_s and (infinite or i < count):
-            _interruptible_sleep(interval_s, ctrl)
+        # The interval is read LIVE from the table each cycle, so the footer's +/-
+        # control changes the pace immediately. Interruptible so pause/stop take
+        # effect at once instead of waiting out the full interval.
+        iv_ms = lt.ping_interval_ms if lt else interval_ms
+        if iv_ms and (infinite or i < count):
+            _interruptible_sleep(max(0, iv_ms) / 1000.0, ctrl)
 
     return dev
 
@@ -3651,6 +3680,7 @@ def scan_subnet(
     ping_count == PING_COUNT_INFINITE keeps pinging until the scan is stopped."""
     live_table = live_table_obj if live_table_obj else LiveTable()
     live_table.offline_after_failures = offline_after_failures
+    live_table.ping_interval_ms = interval_ms   # seed the live +/- footer control
     subnets = [subnet] if isinstance(subnet, str) else list(subnet)
     ip_range = [f"{sn}.{i}" for sn in subnets
                 for i in range(SUBNET_FIRST_IP, SUBNET_LAST_IP + 1)]

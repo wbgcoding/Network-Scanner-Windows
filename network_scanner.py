@@ -396,19 +396,19 @@ def _center_console_window() -> None:
 
         wa = mi.rcWork
         area_w = wa.right  - wa.left
+        area_h = wa.bottom - wa.top   # full height excluding taskbar
 
-        # Horizontally centred, vertically pinned to the top of the work area
-        # so the window takes the full available height (taskbar excluded).
+        # Horizontally centred, fills the full work-area height.
         x = wa.left + max(0, (area_w - win_w) // 2)
         y = wa.top
 
-        # SetWindowPos with SWP_NOSIZE: move without touching the window size.
-        SWP_NOSIZE   = 0x0001
+        # SetWindowPos: move AND set height to fill the screen.
+        # SWP_NOZORDER keeps the window's z-order unchanged.
         SWP_NOZORDER = 0x0004
         HWND_TOP     = 0
         user32.SetWindowPos(hwnd, HWND_TOP,
-                            int(x), int(y), 0, 0,
-                            SWP_NOSIZE | SWP_NOZORDER)
+                            int(x), int(y), int(win_w), int(area_h),
+                            SWP_NOZORDER)
     except Exception:
         pass
 

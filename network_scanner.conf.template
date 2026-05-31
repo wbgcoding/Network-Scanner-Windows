@@ -12,7 +12,7 @@
 
 # ping_threads  Threads during analysis phase.
 #   Range: 1-1000 | Default: 100
-ping_threads = 100
+#ping_threads = 100
 
 # -- PING ----------------------------------------------------------------------
 # init_ping_count  Pings per device during discovery.
@@ -25,7 +25,7 @@ ping_threads = 100
 
 # ping_interval_ms  Pause between two pings to the SAME host (ms).
 #   Keeps fast LAN hosts from racing to 100%. Range: 0-10000 | Default: 100
-ping_interval_ms = 100
+#ping_interval_ms = 100
 
 # refresh_rate  Minimum seconds between screen redraws.
 #   Range: 0.1-60.0 | Default: 1.0
@@ -54,26 +54,26 @@ ping_interval_ms = 100
 # -- OUTPUT --------------------------------------------------------------------
 # output_directory  Folder for scan results (created automatically).
 #   Default: ./Scans
-output_directory = ./Scans
+#output_directory = ./Scans
 
 # file_output  Write a plain-text report after the scan.
 #   Default: true
-file_output = true
+#file_output = true
 
 # export_csv  Also write a machine-readable CSV file next to the report.
 #   Default: false
-export_csv = false
+#export_csv = false
 
 # -- KNOWN-DEVICES DATABASE ----------------------------------------------------
 # known_devices_db  Store devices per network in scanner.db. The DB is updated
 #   after each scan and pre-loaded at startup so known devices appear offline
 #   immediately, switching to online as pings succeed. | Default: true
-known_devices_db = true
+#known_devices_db = true
 
 # -- INTERNET PING -------------------------------------------------------------
 # enable_internet_ping  Ping external hosts to measure internet latency.
 #   Default: true
-enable_internet_ping = true
+#enable_internet_ping = true
 
 # internet_hosts  Comma-separated list of IPv4 addresses.
 #   Default: 8.8.8.8, 8.8.4.4, 1.1.1.1, 9.9.9.9

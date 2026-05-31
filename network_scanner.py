@@ -3,6 +3,7 @@
 
 import socket
 import subprocess
+import ctypes
 import platform
 import re
 import threading
@@ -10,7 +11,7 @@ import sys
 import time
 import select
 import os
-import glob
+import csv
 import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
@@ -39,6 +40,16 @@ else:
     _msvcrt = None
 
 
+# Console font height (pixels). The scanner picks the LARGEST height up to this
+# ceiling at which the full table still fits the screen, so the window adapts to
+# the table width while staying readable. Overridable via the [display]
+# console_font_size config option; 0 disables all font handling.
+CONSOLE_FONT_HEIGHT: int = 18
+# Never shrink the font below this (keeps text readable on small screens; we
+# accept a capped window rather than an unreadable font).
+CONSOLE_FONT_MIN_HEIGHT: int = 12
+
+
 def _run(args, timeout: int = None) -> subprocess.CompletedProcess:
     """subprocess.run wrapper that uses UTF-8 with replacement so Windows OEM
     output (ipconfig, arp, ping) never raises a UnicodeDecodeError."""
@@ -49,25 +60,211 @@ def _run(args, timeout: int = None) -> subprocess.CompletedProcess:
     )
 
 
+def _open_conout() -> int:
+    """Open CONOUT$ and return its handle (or 0 on failure).
+    CONOUT$ always points to the real console window even when sys.stdout is
+    redirected to a pipe or file (which happens when Python runs as a child of
+    PowerShell).  Caller must CloseHandle() the returned value when done."""
+    try:
+        import ctypes
+        GENERIC_READ_WRITE = 0xC0000000
+        FILE_SHARE_RW      = 0x00000003
+        OPEN_EXISTING      = 3
+        INVALID_HANDLE     = ctypes.c_size_t(-1).value
+        h = ctypes.windll.kernel32.CreateFileW(
+            "CONOUT$", GENERIC_READ_WRITE, FILE_SHARE_RW, None, OPEN_EXISTING, 0, None
+        )
+        return h if (h and h != INVALID_HANDLE) else 0
+    except Exception:
+        return 0
+
+
+def _in_windows_terminal() -> bool:
+    """True when running inside Windows Terminal (it sets WT_SESSION). Its ConPTY
+    ignores app-driven window resizing/font changes; only conhost.exe honours them."""
+    return bool(os.environ.get("WT_SESSION"))
+
+
+def _conhost_relaunch_command() -> List[str]:
+    """Command line that re-runs this program under conhost.exe, for both the
+    frozen .exe (sys.frozen) and `python script.py`."""
+    if getattr(sys, "frozen", False):
+        inner = [sys.executable] + sys.argv[1:]
+    else:
+        inner = [sys.executable, os.path.abspath(sys.argv[0])] + sys.argv[1:]
+    return ["conhost.exe"] + inner
+
+
+def _ensure_classic_console() -> None:
+    """Re-host under conhost.exe when launched in Windows Terminal, which ignores
+    the window-resize/font calls the scanner needs. Relaunches once and exits;
+    the NS_CONHOST guard prevents a loop (WT_SESSION is inherited by the child)."""
+    if platform.system() != "Windows":
+        return
+    if os.environ.get("NS_CONHOST") == "1":
+        return
+    if not _in_windows_terminal():
+        return
+    try:
+        env = dict(os.environ)
+        env["NS_CONHOST"] = "1"
+        CREATE_NEW_CONSOLE = 0x00000010
+        subprocess.Popen(_conhost_relaunch_command(), env=env,
+                         creationflags=CREATE_NEW_CONSOLE)
+    except Exception:
+        return   # keep running in place (degraded but usable)
+    else:
+        sys.exit(0)
+
+
 def _enable_windows_ansi() -> None:
-    """Enable VT100/ANSI escape processing in the Windows console."""
+    """Enable VT100/ANSI escape processing in the Windows console.
+    Uses CONOUT$ so it works even when sys.stdout is redirected."""
     try:
         import ctypes
         kernel32 = ctypes.windll.kernel32
-        # ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING
-        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
-        mode = ctypes.c_ulong(0)
-        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
-            kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+        handle = _open_conout()
+        if not handle:
+            return
+        try:
+            mode = ctypes.c_ulong(0)
+            if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                # ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+        finally:
+            kernel32.CloseHandle(handle)
     except Exception:
         pass
 
 
-def _resize_terminal_windows(cols: int, rows: int = 0) -> None:
-    """Resize the Windows console to cols × rows.
-    rows=0 means the maximum height that fits the current screen (GetConsoleScreenBufferInfo
-    dwMaximumWindowSize.Y already accounts for font size, DPI and taskbar height).
-    """
+def _init_console_encoding() -> None:
+    """Force UTF-8 I/O so the block-bar (█/░) and braille-spinner glyphs never
+    raise UnicodeEncodeError. The default stdout encoding is cp1252 in a frozen
+    PyInstaller exe (and some consoles), which cannot encode those characters."""
+    if platform.system() == "Windows":
+        try:
+            kernel32 = ctypes.windll.kernel32
+            kernel32.SetConsoleOutputCP(65001)  # CP_UTF8 — console interprets bytes as UTF-8
+            kernel32.SetConsoleCP(65001)
+        except Exception:
+            pass
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+def _normalize_console_font(height: int = CONSOLE_FONT_HEIGHT) -> bool:
+    """Set the console font to the given pixel height, preserving the existing
+    face/weight (falling back to Consolas). Pass height<=0 to skip. No-op on
+    non-Windows or when no console is attached."""
+    if platform.system() != "Windows" or height <= 0:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _COORD(ctypes.Structure):
+            _fields_ = [("X", wintypes.SHORT), ("Y", wintypes.SHORT)]
+
+        class _CONSOLE_FONT_INFOEX(ctypes.Structure):
+            _fields_ = [
+                ("cbSize",     wintypes.ULONG),
+                ("nFont",      wintypes.DWORD),
+                ("dwFontSize", _COORD),
+                ("FontFamily", wintypes.UINT),
+                ("FontWeight", wintypes.UINT),
+                ("FaceName",   wintypes.WCHAR * 32),
+            ]
+
+        kernel32 = ctypes.windll.kernel32
+        handle = _open_conout()
+        if not handle:
+            return False
+        try:
+            font = _CONSOLE_FONT_INFOEX()
+            font.cbSize = ctypes.sizeof(_CONSOLE_FONT_INFOEX)
+            kernel32.GetCurrentConsoleFontEx(handle, False, ctypes.byref(font))
+            # Keep a sane TrueType face; otherwise use Consolas (a fixed-width font
+            # that renders the block-bar/ANSI glyphs cleanly).
+            if not font.FaceName or font.FaceName.startswith("\x00"):
+                font.FaceName = "Consolas"
+                font.FontFamily = 54   # FF_DONTCARE | TMPF_TRUETYPE
+                font.FontWeight = 400
+            font.dwFontSize = _COORD(0, height)   # width auto
+            return bool(kernel32.SetCurrentConsoleFontEx(handle, False, ctypes.byref(font)))
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        return False
+
+
+def _console_max_cols() -> int:
+    """Largest window width (columns) that fits the screen at the current font
+    (dwMaximumWindowSize.X), or 0 when unavailable."""
+    if platform.system() != "Windows":
+        return 0
+    try:
+        from ctypes import wintypes
+
+        class _COORD(ctypes.Structure):
+            _fields_ = [("X", wintypes.SHORT), ("Y", wintypes.SHORT)]
+
+        class _SMALL_RECT(ctypes.Structure):
+            _fields_ = [
+                ("Left",  wintypes.SHORT), ("Top",    wintypes.SHORT),
+                ("Right", wintypes.SHORT), ("Bottom", wintypes.SHORT),
+            ]
+
+        class _CSBI(ctypes.Structure):
+            _fields_ = [
+                ("dwSize",              _COORD),
+                ("dwCursorPosition",    _COORD),
+                ("wAttributes",         wintypes.WORD),
+                ("srWindow",            _SMALL_RECT),
+                ("dwMaximumWindowSize", _COORD),
+            ]
+
+        kernel32 = ctypes.windll.kernel32
+        handle = _open_conout()
+        if not handle:
+            return 0
+        try:
+            csbi = _CSBI()
+            if kernel32.GetConsoleScreenBufferInfo(handle, ctypes.byref(csbi)):
+                return int(csbi.dwMaximumWindowSize.X)
+            return 0
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        return 0
+
+
+def _fit_console_font(needed_cols: int,
+                      max_height: int = CONSOLE_FONT_HEIGHT,
+                      min_height: int = CONSOLE_FONT_MIN_HEIGHT) -> int:
+    """Apply the largest font height in [min_height, max_height] at which
+    `needed_cols` columns still fit on screen, so the window can grow to the full
+    table width while staying as readable as possible (only shrinks when needed).
+    Returns the height applied, or 0 when font handling is disabled/unavailable."""
+    if platform.system() != "Windows" or max_height <= 0:
+        return 0
+    lo = max(1, min(min_height, max_height))
+    applied = 0
+    for h in range(max_height, lo - 1, -1):
+        if not _normalize_console_font(h):
+            continue
+        applied = h
+        if _console_max_cols() >= needed_cols:
+            break
+    return applied
+
+
+def _resize_terminal_windows(cols: int, rows: int = 0) -> Tuple[int, int]:
+    """Resize the Windows console to cols × rows via CONOUT$.
+    rows=0 → maximum height that fits the screen.
+    Returns (actual_cols, actual_rows) after resize, or (0, 0) on failure."""
     try:
         import ctypes
         from ctypes import wintypes
@@ -83,60 +280,137 @@ def _resize_terminal_windows(cols: int, rows: int = 0) -> None:
 
         class _CSBI(ctypes.Structure):
             _fields_ = [
-                ("dwSize",            _COORD),
-                ("dwCursorPosition",  _COORD),
-                ("wAttributes",       wintypes.WORD),
-                ("srWindow",          _SMALL_RECT),
+                ("dwSize",              _COORD),
+                ("dwCursorPosition",    _COORD),
+                ("wAttributes",         wintypes.WORD),
+                ("srWindow",            _SMALL_RECT),
                 ("dwMaximumWindowSize", _COORD),
             ]
 
         kernel32 = ctypes.windll.kernel32
-        handle   = kernel32.GetStdHandle(-11)
-        csbi     = _CSBI()
-        if not kernel32.GetConsoleScreenBufferInfo(handle, ctypes.byref(csbi)):
-            return
-        # dwMaximumWindowSize is 0 when stdout is a pipe/redirect — nothing to resize
-        if csbi.dwMaximumWindowSize.X == 0 or csbi.dwMaximumWindowSize.Y == 0:
-            return
+        handle = _open_conout()
+        if not handle:
+            return (0, 0)
 
-        # Target size — capped to what the screen can physically show
-        target_cols = min(cols, csbi.dwMaximumWindowSize.X)
-        target_rows = (csbi.dwMaximumWindowSize.Y if rows <= 0
-                       else min(rows, csbi.dwMaximumWindowSize.Y))
+        try:
+            csbi = _CSBI()
+            if not kernel32.GetConsoleScreenBufferInfo(handle, ctypes.byref(csbi)):
+                return (0, 0)
+            if csbi.dwMaximumWindowSize.X == 0 or csbi.dwMaximumWindowSize.Y == 0:
+                return (0, 0)
 
-        # Growing the window past the current buffer → enlarge buffer first
-        if target_cols > csbi.dwSize.X or target_rows > csbi.dwSize.Y:
-            kernel32.SetConsoleScreenBufferSize(
-                handle,
-                _COORD(max(csbi.dwSize.X, target_cols),
-                       max(csbi.dwSize.Y, target_rows))
+            # The window can only grow as far as the screen allows at the current
+            # font (_fit_console_font already chose a fitting one).
+            target_cols = min(cols, csbi.dwMaximumWindowSize.X)
+            target_rows = (csbi.dwMaximumWindowSize.Y if rows <= 0
+                           else min(rows, csbi.dwMaximumWindowSize.Y))
+
+            # Buffer must be at least the window size. Grow it first (shrinking a
+            # large scroll buffer often fails and would undo the resize).
+            if target_cols > csbi.dwSize.X or target_rows > csbi.dwSize.Y:
+                kernel32.SetConsoleScreenBufferSize(
+                    handle,
+                    _COORD(max(csbi.dwSize.X, target_cols),
+                           max(csbi.dwSize.Y, target_rows))
+                )
+
+            kernel32.SetConsoleWindowInfo(
+                handle, True,
+                ctypes.byref(_SMALL_RECT(0, 0, target_cols - 1, target_rows - 1))
             )
 
-        # Resize the visible window
-        kernel32.SetConsoleWindowInfo(
-            handle, True,
-            ctypes.byref(_SMALL_RECT(0, 0, target_cols - 1, target_rows - 1))
-        )
-
-        # Keep scroll buffer at 2× window so previous scan output is scrollable
-        kernel32.SetConsoleScreenBufferSize(
-            handle, _COORD(target_cols, target_rows * 2)
-        )
+            # Re-read to report the size actually applied.
+            after = _CSBI()
+            kernel32.GetConsoleScreenBufferInfo(handle, ctypes.byref(after))
+            actual_cols = after.srWindow.Right - after.srWindow.Left + 1
+            actual_rows = after.srWindow.Bottom - after.srWindow.Top + 1
+            return (actual_cols, actual_rows)
+        finally:
+            kernel32.CloseHandle(handle)
     except Exception:
-        pass
+        return (0, 0)
 
 
-def _resize_terminal(cols: int, rows: int = 0) -> None:
-    """Resize the terminal to cols wide × rows tall.
-    rows=0 → maximum screen height (platform-specific logic).
-    """
+def _resize_terminal(cols: int, rows: int = 0) -> Tuple[int, int]:
+    """Resize terminal to cols × rows.  rows=0 → max screen height.
+    Returns (actual_cols, actual_rows), or (0, 0) when resize is not applicable."""
     if platform.system() == "Windows":
-        _resize_terminal_windows(cols, rows)
+        return _resize_terminal_windows(cols, rows)
     elif sys.stdin.isatty():
-        # xterm escape: rows=9999 lets the terminal expand to its own screen limit
         r = rows if rows > 0 else 9999
         sys.stdout.write(f"\033[8;{r};{cols}t")
         sys.stdout.flush()
+    return (0, 0)
+
+
+def _center_console_window() -> None:
+    """Move the console window to the centre of its current monitor (Windows).
+    Uses the work area (excludes the taskbar) and MonitorFromWindow so it works
+    correctly on multi-monitor setups. SetWindowPos is used instead of MoveWindow
+    so the window size is never accidentally changed by the centering call.
+    No-op on non-Windows or when no console window is attached."""
+    if platform.system() != "Windows":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32   = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+
+        # GetConsoleWindow can return 0 briefly at startup (window not yet ready).
+        # Try a second time after a tiny pause before giving up.
+        hwnd = kernel32.GetConsoleWindow()
+        if not hwnd:
+            time.sleep(0.05)
+            hwnd = kernel32.GetConsoleWindow()
+        if not hwnd:
+            return
+
+        # Current window rect (pixel coordinates on the virtual desktop).
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return
+        win_w = rect.right - rect.left
+
+        # Get the monitor that currently contains (most of) the window, then
+        # query its work area (screen minus taskbar/docks).
+        MONITOR_DEFAULTTONEAREST = 2
+
+        class _MONITORINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize",    wintypes.DWORD),
+                ("rcMonitor", wintypes.RECT),
+                ("rcWork",    wintypes.RECT),
+                ("dwFlags",   wintypes.DWORD),
+            ]
+
+        mi = _MONITORINFO()
+        mi.cbSize = ctypes.sizeof(_MONITORINFO)
+        hmon = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+        if not user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+            # Fallback: primary-monitor work area
+            work = wintypes.RECT()
+            user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(work), 0)
+            mi.rcWork = work
+
+        wa = mi.rcWork
+        area_w = wa.right  - wa.left
+
+        # Horizontally centred, vertically pinned to the top of the work area
+        # so the window takes the full available height (taskbar excluded).
+        x = wa.left + max(0, (area_w - win_w) // 2)
+        y = wa.top
+
+        # SetWindowPos with SWP_NOSIZE: move without touching the window size.
+        SWP_NOSIZE   = 0x0001
+        SWP_NOZORDER = 0x0004
+        HWND_TOP     = 0
+        user32.SetWindowPos(hwnd, HWND_TOP,
+                            int(x), int(y), 0, 0,
+                            SWP_NOSIZE | SWP_NOZORDER)
+    except Exception:
+        pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -145,14 +419,20 @@ def _resize_terminal(cols: int, rows: int = 0) -> None:
 
 # ── Default Ping Values ──────────────────────────────────────────────────────
 DEFAULT_PING_COUNT: int = 10
-PING_COUNT_OPTIONS: Tuple[int, ...] = (10, 100, 1_000, 10_000, 100_000, 1_000_000)
+# Presets offered in the restart menu. The 1,000,000 preset was dropped in favour
+# of the unlimited (∞) mode below.
+PING_COUNT_OPTIONS: Tuple[int, ...] = (10, 100, 1_000, 10_000, 100_000)
+# Sentinel target meaning "ping forever" (∞ mode): each device keeps pinging at
+# PING_INTERVAL_MS until the user stops the run. -1 is never a valid real count.
+PING_COUNT_INFINITE: int = -1
 
 # ── Discovery Phase ──────────────────────────────────────────────────────────
 DISCOVERY_PING_COUNT: int = 1
+ANALYSIS_MAX_CONSECUTIVE_FAILURES: int = 5  # Stop pinging a device after this many consecutive failures
 
 # ── Subnet Scanning ──────────────────────────────────────────────────────────
 SUBNET_FIRST_IP: int = 1
-SUBNET_LAST_IP: int = 255
+SUBNET_LAST_IP: int = 254   # .255 is the broadcast address — a /24 has 254 usable hosts
 SUBNET_OCTET_COUNT: int = 3
 IP_OCTET_COUNT: int = 4
 
@@ -165,12 +445,21 @@ HIGH_PRESSURE_SUBTHREADS_PER_DEVICE: int = 10
 PING_TIMEOUT_SECONDS: int = 2
 WINDOWS_PING_TIMEOUT_MS: int = 1000
 UNIX_PING_TIMEOUT_S: int = 1
+# Pause between two consecutive pings to the SAME host (milliseconds). Without it
+# a high ping_count races to 100% on fast LAN hosts; this paces each host so a
+# run takes a sensible amount of time. Overridable via [scanning] ping_interval_ms.
+PING_INTERVAL_MS: int = 100
 RENDER_THROTTLE_SECONDS: float = 1.0
+# Minimum gap between live redraws. Each ping wakes the render thread, but bursts
+# from many worker threads are coalesced to at most one redraw per this interval
+# (≈33 fps) so the screen updates live and smoothly without flicker.
+LIVE_RENDER_MIN_INTERVAL: float = 0.03
 GROUP_CALC_INTERVAL_SECONDS: int = 5
 INPUT_POLL_TIMEOUT: float = 0.1
 INPUT_READ_SIZE: int = 3
 KEY_SLEEP_INTERVAL: float = 0.01
 ARP_TIMEOUT_SECONDS: int = 2
+NETBIOS_TIMEOUT_SECONDS: int = 6
 
 # ── Initial Internet Ping ────────────────────────────────────────────────────
 INITIAL_INTERNET_PING_COUNT: int = 3
@@ -183,30 +472,29 @@ INTERNET_HOST_NAMES: Dict[str, str] = {
 }
 
 # ── Table Layout ─────────────────────────────────────────────────────────────
-TABLE_WIDTH: int = 149
+TABLE_WIDTH: int = 131   # 119 base + 12 for the "Last Ping" column
 TERMINAL_ROWS: int = 50
 TERMINAL_COLS: int = 148
-PROGRESS_BAR_MAX_LEN: int = 55
+PROGRESS_BAR_MAX_LEN: int = 46
 PROGRESS_BAR_MARGIN: int = 4
 DEVICE_PROGRESS_BAR_MARGIN: int = 4
+HEADER_INFO_GAP: int = 2   # gap bars→stats and stats→net (kept tight, packed left)
 
 # ── Column Widths ────────────────────────────────────────────────────────────
-COL_IP_WIDTH: int = 19
-COL_STATUS_WIDTH: int = 13
-COL_GROUP_WIDTH: int = 5
-COL_HOSTNAME_WIDTH: int = 30
-COL_PING_WIDTH: int = 13
-COL_PROGRESS_WIDTH: int = 13
-COL_MAC_WIDTH: int = 21
-HOSTNAME_TRUNCATE_LEN: int = 27
-HOSTNAME_MAX_DISPLAY: int = 30
+COL_IP_WIDTH: int = 15       # "192.168.100.100" = 15 chars
+COL_STATUS_WIDTH: int = 9    # "OFFLINE" = 7, 1 pad each side
+COL_GROUP_WIDTH: int = 5     # "███" = 3, 1 pad each side
+COL_HOSTNAME_WIDTH: int = 22 # truncated hostname
+COL_PING_WIDTH: int = 12     # "1.000,00ms" = 10, 1 pad each side
+COL_PROGRESS_WIDTH: int = 13 # "10.000/10.000" = 13, fits exactly
+COL_MAC_WIDTH: int = 18      # "AA:BB:CC:DD:EE:FF" = 17, 1 pad
 
 # ── Statistic Panel ────────────────────────────────────────────────────────
 STAT_LEFT_WIDTH: int = 65
 STAT_DIVIDER_LEN: int = 30
 
 # ── Group Colors ─────────────────────────────────────────────────────────────
-GROUP_UNKNOWN_COLOR: int = 196          # Red
+GROUP_UNKNOWN_COLOR: int = 244          # Gray (unknown devices, unless already grouped)
 GROUP_GATEWAY_COLOR_DEFAULT: int = 46   # Green
 GROUP_GATEWAY_COLOR_UNIFI: int = 21     # Blue
 GROUP_GATEWAY_COLOR_FRITZBOX: int = 196 # Red
@@ -214,8 +502,91 @@ GROUP_DYNAMIC_COLORS: List[int] = [
     196, 202, 208, 214, 220, 226, 190, 154, 118, 82,   # reds/oranges/yellows/greens
     46, 51, 21, 27, 33, 39, 45, 50, 63, 69,            # greens/teals/purples
     75, 81, 87, 93, 99, 105, 111, 117, 129, 135,       # blues/cyans
-    141, 147, 201, 207, 213, 219, 225, 231, 165, 171  # magentas/cyans
+    141, 147, 201, 207, 213, 219, 225, 231, 165, 171   # magentas/cyans
 ]
+
+
+def _xterm_to_rgb(n: int) -> Tuple[int, int, int]:
+    """Approximate RGB values for an xterm-256 colour index."""
+    _BASIC_16 = [
+        (0,0,0),(128,0,0),(0,128,0),(128,128,0),
+        (0,0,128),(128,0,128),(0,128,128),(192,192,192),
+        (128,128,128),(255,0,0),(0,255,0),(255,255,0),
+        (0,0,255),(255,0,255),(0,255,255),(255,255,255),
+    ]
+    if n < 16:
+        return _BASIC_16[n]
+    if n < 232:
+        n -= 16
+        conv = lambda x: 0 if x == 0 else 55 + 40 * x
+        return conv(n // 36), conv((n % 36) // 6), conv(n % 6)
+    v = 8 + (n - 232) * 10
+    return v, v, v
+
+
+def _color_dist_sq(a: int, b: int) -> int:
+    """Squared Euclidean distance between two xterm-256 colours in RGB space."""
+    ra, ga, ba = _xterm_to_rgb(a)
+    rb, gb, bb = _xterm_to_rgb(b)
+    return (ra - rb) ** 2 + (ga - gb) ** 2 + (ba - bb) ** 2
+
+
+def _max_diversity_sequence(colors: List[int]) -> List[int]:
+    """Return `colors` reordered so each colour is as far as possible (in RGB
+    space) from all previously placed ones. Guarantees that any k active groups
+    get k maximally-distinct colours regardless of k — no two similar colours
+    will ever appear adjacent in the assignment order."""
+    if len(colors) <= 1:
+        return list(colors)
+    remaining = list(colors)
+    # Anchor: start with the most saturated red-channel colour (reproducible).
+    first = max(remaining, key=lambda c: _xterm_to_rgb(c)[0])
+    ordered = [first]
+    remaining.remove(first)
+    while remaining:
+        # Greedy pick: maximise the minimum distance to any already-placed colour.
+        best = max(remaining,
+                   key=lambda c: min(_color_dist_sq(c, p) for p in ordered))
+        ordered.append(best)
+        remaining.remove(best)
+    return ordered
+
+
+# Minimum acceptable squared RGB distance between any two group colours.
+# sqrt(16900) ≈ 130 — solid block chars (███) closer than this look visually
+# similar on a dark terminal background. Empirically derived threshold that
+# gives ~9 clearly-distinct colours from the xterm-256 palette.
+MIN_GROUP_COLOR_DIST_SQ: int = 16900
+
+
+def _filter_diverse_colors(colors: List[int], min_dist_sq: int) -> List[int]:
+    """Return a maximal subset of `colors` where every pair has squared distance
+    >= min_dist_sq. Iteratively removes the colour with the most too-close
+    neighbours until the constraint is satisfied throughout."""
+    pool = list(colors)
+    changed = True
+    while changed:
+        changed = False
+        # Score each colour by how many others in the pool are too close.
+        close = {c: sum(1 for o in pool if o != c and _color_dist_sq(c, o) < min_dist_sq)
+                 for c in pool}
+        worst_score = max(close.values())
+        if worst_score > 0:
+            # Break ties by removing the colour that is lexically last so the
+            # result is deterministic across Python runs.
+            worst = max((c for c in pool if close[c] == worst_score), key=lambda c: -c)
+            pool.remove(worst)
+            changed = True
+    return pool
+
+
+# Pre-computed assignment sequence. The pool is first filtered so that every
+# colour in it is at least ~150 RGB units from every other, then ordered by the
+# max-diversity greedy algorithm. Any k active groups therefore get k colours
+# that all look clearly distinct — no two similar colours ever.
+GROUP_COLOR_SEQUENCE: List[int] = _max_diversity_sequence(
+    _filter_diverse_colors(GROUP_DYNAMIC_COLORS, MIN_GROUP_COLOR_DIST_SQ)
+)
 
 # ── Group IDs ────────────────────────────────────────────────────────────────
 GROUP_ID_NONE: int = 0
@@ -249,6 +620,7 @@ COLOR_DARK_GRAY: str = '\033[90m'
 COLOR_ORANGE: str = '\033[1;38;5;208m'
 COLOR_LIGHT_BLUE: str = '\033[1;38;5;117m'
 COLOR_LIGHT_GREEN: str = '\033[1;38;5;154m'
+COLOR_PURPLE: str = '\033[1;38;5;93m'   # ∞ (unlimited) mode accent
 
 # ── Title Colors (randomized each render) ─────────────────────────────────────
 TITLE_COLORS: List[int] = [
@@ -257,6 +629,16 @@ TITLE_COLORS: List[int] = [
     21, 27, 33, 39, 45, 51, 87, 123, 159, 195,
     214, 220, 226, 190, 154, 118, 82, 46, 77, 72
 ]
+
+# Animated spinner shown left of the phase status: each redraw picks a random
+# char in a random colour. Special characters only (no digits/letters), ASCII so
+# it renders in every console. Thin/low glyphs (. , ' ` : ; - ^ ~) are excluded —
+# they look like specks; only visually substantial characters are kept.
+SPINNER_CHARS: str = "@#$%&*+=?!<>()[]{}"
+
+# ── Live Controls Footer (shown at the bottom while scanning) ────────────────
+CONTROLS_HINT_RUNNING: str = "[P] Pause    [Q] Abbrechen (Ergebnis speichern)    [ESC] Sofort beenden"
+CONTROLS_HINT_PAUSED:  str = "PAUSE  —  [P] weiter    [Q] abbrechen    [ESC] beenden"
 
 # ── Phase Numbers ────────────────────────────────────────────────────────────
 PHASE_DISCOVERY: int = 1
@@ -269,6 +651,15 @@ UNKNOWN_VALUE: str = "Unknown"
 STATUS_ONLINE: str = "ONLINE"
 STATUS_OFFLINE: str = "OFFLINE"
 STATUS_UNKNOWN: str = "UNKNOWN"
+INFINITE_SYMBOL: str = "∞"
+
+# ── Output ───────────────────────────────────────────────────────────────────
+DEFAULT_OUTPUT_DIR: str = "./Scans"
+
+# ── Known-Devices Database & CSV Export ──────────────────────────────────────
+KNOWN_DEVICES_DB_FILE: str = "known_devices.db"
+CSV_FILENAME_PREFIX: str = "network_scan_"
+TXT_FILENAME_PREFIX: str = "network_scan_"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -281,7 +672,9 @@ _CONF_RANGES: Dict[str, Tuple] = {
     'ping_threads':      (1, 1000),
     'init_ping_count':   (1, 100),
     'ping_count':        (1, 10_000_000),
+    'ping_interval_ms':  (0, 10_000),   # pause between pings to the same host
     'refresh_rate':      (0.1, 60.0),
+    'console_font_size': (0, 72),   # 0 = leave the console font untouched
 }
 
 
@@ -395,6 +788,26 @@ class ConfigManager:
         val = self.get(key, None, section)
         return str(val).strip() if val is not None else fallback
 
+    def get_subnets(self) -> List[str]:
+        """Collect every configured subnet: 'subnet' plus 'subnet_2', 'subnet_3',
+        … across all sections. Returns values in ascending key order, de-duped."""
+        found: Dict[str, str] = {}
+        for sec_values in self._section.values():
+            for key, val in sec_values.items():
+                if re.fullmatch(r'subnet(_\d+)?', key) and str(val).strip():
+                    found[key] = str(val).strip()
+
+        def _order(k: str) -> int:
+            return 0 if k == 'subnet' else int(k.split('_', 1)[1])
+
+        result, seen = [], set()
+        for key in sorted(found, key=_order):
+            v = found[key]
+            if v not in seen:
+                seen.add(v)
+                result.append(v)
+        return result
+
     def print_warnings(self) -> None:
         if self._warnings:
             print(f"\n{COLOR_YELLOW}Konfigurations-Warnungen:{COLOR_RESET}")
@@ -416,102 +829,101 @@ def load_config_manager() -> ConfigManager:
 
 
 # ── Template constant ─────────────────────────────────────────────────────────
+# Single source of truth for network_scanner.conf.template. Everything is
+# commented out, so a fresh config runs entirely on the built-in defaults.
 _CONF_TEMPLATE_CONTENT = """\
 # ═══════════════════════════════════════════════════════════════════════════════
-# Network Scanner — Konfigurationsdatei
-# Kopiere diese Datei nach network_scanner.conf und passe die Werte an.
-# Zeilen mit # oder ; werden ignoriert. Ungültige Werte werden auf Standardwerte
-# zurückgesetzt.
+# Network Scanner — configuration file
+# Copy this file to 'network_scanner.conf' and adjust the values.
+# Lines starting with # or ; are ignored. Out-of-range or invalid values are
+# corrected to the defaults shown below.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# ── THREADS ─────────────────────────────────────────────────────────────────
-# init_ping_threads  Threads in der Discovery-Phase.  0 = ein Thread pro IP.
-#   Bereich: 0–1000 | Standard: 254
+# ── THREADS ──────────────────────────────────────────────────────────────────
+# init_ping_threads  Threads used during the discovery phase. 0 = one per IP.
+#   Range: 0-1000 | Default: 254
 #init_ping_threads = 254
 
-# ping_threads  Threads in der Analyse-Phase.
-#   Bereich: 1–1000 | Standard: 100
-ping_threads = 100
+# ping_threads  Threads used during the analysis phase.
+#   Range: 1-1000 | Default: 100
+#ping_threads = 100
 
-# ── PING ────────────────────────────────────────────────────────────────────
-# init_ping_count  Pings pro Gerät in der Discovery-Phase.
-#   Bereich: 1–100 | Standard: 1
+# ── PING ───────────────────────────────────────────────────────────────────────
+# init_ping_count  Pings per device during discovery.
+#   Range: 1-100 | Default: 1
 #init_ping_count = 1
 
-# ping_count  Pings pro Gerät in der Analyse-Phase.
-#   Bereich: 1–10.000.000 | Standard: 10
+# ping_count  Pings per device during analysis.
+#   Range: 1-10000000 | Default: 10
 #ping_count = 10
 
-# refresh_rate  Mindestabstand zwischen Bildschirmaktualisierungen (Sekunden).
-#   Bereich: 0.1–60.0 | Standard: 1.0
+# ping_interval_ms  Pause between two pings to the SAME host, in milliseconds.
+#   Keeps fast LAN hosts from racing to 100%. Range: 0-10000 | Default: 100
+#ping_interval_ms = 100
+
+# refresh_rate  Minimum seconds between screen redraws.
+#   Range: 0.1-60.0 | Default: 1.0
 #refresh_rate = 1.0
 
-# ── NETZWERK ────────────────────────────────────────────────────────────────
-# subnet  Zielnetz in CIDR-Notation.  Leer = automatische Erkennung.
-#   Beispiel: 192.168.1.0/24
-# subnet = 192.168.1.0/24
+# console_font_size  Console font height in pixels forced on startup
+#   (0 = leave the console font untouched). Range: 0-72 | Default: 18
+#console_font_size = 18
 
-# Zusätzliche Netze für denselben Scan-Durchlauf (werden nacheinander gescannt).
-# subnet_2 = 10.0.0.0/24
-# subnet_3 = 172.16.0.0/24
-# subnet_4 = 192.168.2.0/24
+# ── NETWORK ────────────────────────────────────────────────────────────────────
+# subnet  Target subnet in CIDR notation. Leave empty for auto-detection.
+#   Example: 192.168.1.0/24
+#subnet = 192.168.1.0/24
 
-# ── HIGH PRESSURE MODE ──────────────────────────────────────────────────────
-# Alle Geräte gleichzeitig mit mehreren Subthreads pingen.
-#   true  = maximaler Durchsatz (hohe CPU/Netzlast)
-#   false = zweiphasiger Scan (Discovery + Analyse)  | Standard: false
+# Additional subnets scanned in the same run, in order.
+#subnet_2 = 10.0.0.0/24
+#subnet_3 = 172.16.0.0/24
+#subnet_4 = 192.168.2.0/24
+
+# ── HIGH PRESSURE MODE ─────────────────────────────────────────────────────────
+# high_pressure_mode  Ping every device at once with several subthreads each.
+#   true  = maximum throughput (high CPU/network load)
+#   false = pipelined scan (discovery + analysis)  | Default: false
 #high_pressure_mode = false
 
-# ── AUSGABE ─────────────────────────────────────────────────────────────────
-# output_directory  Verzeichnis für Scan-Ergebnisse. Wird automatisch angelegt.
-#   Standard: . (aktuelles Verzeichnis)
-output_directory = .
+# ── OUTPUT ─────────────────────────────────────────────────────────────────────
+# output_directory  Folder for scan results (created automatically).
+#   Default: ./Scans
+output_directory = ./Scans
 
-# file_output  Ergebnisse nach dem Scan in eine Textdatei schreiben.
-#   Standard: true
+# file_output  Write a plain-text report after the scan.
+#   Default: true
 #file_output = true
 
-# ── INTERNET-PING ───────────────────────────────────────────────────────────
-# enable_internet_ping  Externe Hosts für Latenzmessung pingen.
-#   Standard: true
+# export_csv  Also write a machine-readable CSV file next to the report.
+#   Default: false
+#export_csv = false
+
+# ── KNOWN-DEVICES DATABASE ─────────────────────────────────────────────────────
+# known_devices_db  Remember devices per network (keyed by the gateway MAC) in a
+#   local SQLite file. When the same router is recognised again, its known
+#   devices are listed even while offline, and the database is updated each run.
+#   Default: true
+#known_devices_db = true
+
+# ── INTERNET PING ──────────────────────────────────────────────────────────────
+# enable_internet_ping  Ping external hosts to measure internet latency.
+#   Default: true
 #enable_internet_ping = true
 
-# internet_hosts  Kommagetrennte Liste von IPv4-Adressen.
-#   Standard: 8.8.8.8, 8.8.4.4, 1.1.1.1, 9.9.9.9
+# internet_hosts  Comma-separated list of IPv4 addresses.
+#   Default: 8.8.8.8, 8.8.4.4, 1.1.1.1, 9.9.9.9
 #internet_hosts = 8.8.8.8, 8.8.4.4, 1.1.1.1, 9.9.9.9
 """
 
 
 def _ensure_conf_template() -> None:
-    """Write network_scanner.conf.template if it does not already exist."""
+    """Always write the canonical template so it never goes stale after an update."""
     path = "network_scanner.conf.template"
-    if os.path.isfile(path):
-        return
     try:
         with open(path, 'w', encoding='utf-8') as f:
             f.write(_CONF_TEMPLATE_CONTENT)
     except Exception:
         pass
-
-
-def print_config_info(cfg: ConfigManager):
-    """Print a formatted summary of the active configuration."""
-    print(f"\n{COLOR_BRIGHT_WHITE}Configuration:{COLOR_RESET}")
-    print(f"  ping_count:          {COLOR_CYAN}{cfg.get_int('ping_count', DEFAULT_PING_COUNT, 'scanning')}{COLOR_RESET}")
-    print(f"  ping_threads:        {COLOR_CYAN}{cfg.get_int('ping_threads', MAX_WORKERS_ANALYSIS, 'scanning')}{COLOR_RESET}")
-    print(f"  init_ping_threads:   {COLOR_CYAN}{cfg.get_int('init_ping_threads', MAX_WORKERS_INIT, 'scanning')}{COLOR_RESET}")
-    print(f"  init_ping_count:     {COLOR_CYAN}{cfg.get_int('init_ping_count', DISCOVERY_PING_COUNT, 'scanning')}{COLOR_RESET}")
-    print(f"  refresh_rate:        {COLOR_CYAN}{cfg.get_float('refresh_rate', RENDER_THROTTLE_SECONDS, 'scanning')}s{COLOR_RESET}")
-    subnet = cfg.get_str('subnet', '', 'network')
-    print(f"  subnet:              {COLOR_CYAN}{subnet or 'Auto-detect'}{COLOR_RESET}")
-    hp = cfg.get_bool('high_pressure_mode', False, 'scanning')
-    print(f"  high_pressure_mode:  {COLOR_CYAN}{hp}{COLOR_RESET}")
-    inet = cfg.get_bool('enable_internet_ping', True, 'internet')
-    print(f"  internet_ping:       {COLOR_CYAN}{inet}{COLOR_RESET}")
-    if inet:
-        ih = cfg.get_str('internet_hosts', '8.8.8.8, 8.8.4.4, 1.1.1.1, 9.9.9.9', 'internet')
-        print(f"  internet_hosts:      {COLOR_CYAN}{ih}{COLOR_RESET}")
-    print()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -530,13 +942,15 @@ class Device:
     target_pings: int = DEFAULT_PING_COUNT
     group_id: int = GROUP_ID_NONE
     is_offline: bool = False
+    last_ping: Optional[float] = None   # most recently measured latency (ms)
+    from_db: bool = False   # known device loaded from the DB (may be offline)
 
 
 class ScannerControl:
     """Manages scan state and user interruptions."""
     def __init__(self):
         self.stop_requested = False
-        self.restart_requested = False
+        self.hard_exit = False   # ESC: abort immediately, no end screen
         self.paused = False
         self.shutdown = False
         self.lock = threading.Lock()
@@ -546,18 +960,21 @@ class ScannerControl:
     def reset(self):
         with self.lock:
             self.stop_requested = False
-            self.restart_requested = False
+            self.hard_exit = False
             self.paused = False
         self.pause_event.set()
+
+    def request_hard_exit(self):
+        """ESC pressed: stop everything at once and skip the end screen."""
+        with self.lock:
+            self.hard_exit = True
+            self.stop_requested = True
+            self.shutdown = True
+        self.pause_event.set()  # Unblock any paused worker so it can exit
 
     def request_stop(self):
         with self.lock:
             self.stop_requested = True
-        self.pause_event.set()  # Unblock if paused
-
-    def request_restart(self):
-        with self.lock:
-            self.restart_requested = True
         self.pause_event.set()  # Unblock if paused
 
     def toggle_pause(self):
@@ -574,7 +991,7 @@ class ScannerControl:
 
     def should_exit_task(self) -> bool:
         with self.lock:
-            return self.stop_requested or self.restart_requested or self.shutdown
+            return self.stop_requested or self.shutdown
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -761,6 +1178,148 @@ def get_subnet(ip: str) -> Optional[str]:
     return None
 
 
+# ── Windows high-resolution ICMP (sub-millisecond latency, no admin) ─────────
+# The Windows `ping.exe` only reports whole milliseconds and prints "<1ms" for
+# anything faster. To get sub-millisecond values like Linux's ping, we send the
+# echo request through the IP Helper API (iphlpapi!IcmpSendEcho — no admin
+# required) and time the round-trip with a high-resolution clock.
+_ICMP_API = None          # cached iphlpapi handle (or False once known-bad)
+_ICMP_INET_ADDR = None    # cached ws2_32.inet_addr
+
+
+class _IP_OPTION_INFORMATION(ctypes.Structure):
+    _fields_ = [("Ttl", ctypes.c_ubyte),
+                ("Tos", ctypes.c_ubyte),
+                ("Flags", ctypes.c_ubyte),
+                ("OptionsSize", ctypes.c_ubyte),
+                ("OptionsData", ctypes.POINTER(ctypes.c_ubyte))]
+
+
+class _ICMP_ECHO_REPLY(ctypes.Structure):
+    _fields_ = [("Address", ctypes.c_uint32),
+                ("Status", ctypes.c_uint32),
+                ("RoundTripTime", ctypes.c_uint32),
+                ("DataSize", ctypes.c_uint16),
+                ("Reserved", ctypes.c_uint16),
+                ("Data", ctypes.c_void_p),
+                ("Options", _IP_OPTION_INFORMATION)]
+
+
+def _ensure_icmp_api():
+    """Lazily wire up the IP Helper API. Returns the iphlpapi handle or None."""
+    global _ICMP_API, _ICMP_INET_ADDR
+    if _ICMP_API is not None:
+        return _ICMP_API or None
+    try:
+        from ctypes import wintypes
+        api = ctypes.windll.iphlpapi
+        ws2 = ctypes.windll.ws2_32
+        api.IcmpCreateFile.restype = wintypes.HANDLE
+        api.IcmpCloseHandle.argtypes = [wintypes.HANDLE]
+        api.IcmpSendEcho.restype = wintypes.DWORD
+        api.IcmpSendEcho.argtypes = [
+            wintypes.HANDLE, ctypes.c_uint32, ctypes.c_void_p, wintypes.WORD,
+            ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
+        ]
+        ws2.inet_addr.restype = ctypes.c_uint32
+        ws2.inet_addr.argtypes = [ctypes.c_char_p]
+        _ICMP_API = api
+        _ICMP_INET_ADDR = ws2.inet_addr
+    except Exception:
+        _ICMP_API = False
+    return _ICMP_API or None
+
+
+def windows_icmp_ping(ip: str, timeout_ms: int) -> Optional[Tuple[bool, Optional[float], Optional[int]]]:
+    """Send one ICMP echo via the IP Helper API and time it with a
+    high-resolution clock. Returns (success, latency_ms, ttl), with sub-ms
+    precision, or None if the API is unavailable (caller falls back to ping.exe)."""
+    api = _ensure_icmp_api()
+    if api is None:
+        return None
+    try:
+        from ctypes import wintypes
+        dest = _ICMP_INET_ADDR(ip.encode('ascii'))
+        if dest == 0xFFFFFFFF:  # INADDR_NONE — let the caller fall back
+            return None
+        handle = api.IcmpCreateFile()
+        if not handle or handle == wintypes.HANDLE(-1).value:
+            return None
+        try:
+            data = b'abcdefghijklmnopqrstuvwabcdefghi'  # 32 bytes, like ping.exe
+            reply_size = ctypes.sizeof(_ICMP_ECHO_REPLY) + len(data) + 8
+            reply_buf = ctypes.create_string_buffer(reply_size)
+            t0 = time.perf_counter()
+            n = api.IcmpSendEcho(handle, dest, data, len(data), None,
+                                 reply_buf, reply_size, int(timeout_ms))
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            if n == 0:
+                return (False, None, None)
+            reply = ctypes.cast(reply_buf, ctypes.POINTER(_ICMP_ECHO_REPLY)).contents
+            if reply.Status != 0:  # 0 == IP_SUCCESS
+                return (False, None, None)
+            return (True, elapsed_ms, reply.Options.Ttl)
+        finally:
+            api.IcmpCloseHandle(handle)
+    except Exception:
+        return None
+
+
+def _netbios_lookup(ip: str) -> Tuple[Optional[str], Optional[str]]:
+    """Query a host directly via `nbtstat -A` (UDP/137) and return
+    (hostname, mac). This works across subnets where reverse DNS has no PTR
+    record and ARP cannot reach (a routed host). Locale-independent: keys off
+    the <20>/<00> name-table codes, not the localized UNIQUE/GROUP words."""
+    try:
+        res = _run(["nbtstat", "-A", ip], timeout=NETBIOS_TIMEOUT_SECONDS)
+    except Exception:
+        return (None, None)
+    if not res or not res.stdout:
+        return (None, None)
+    text = res.stdout
+    name = None
+    # Prefer <20> (File Server Service — always the unique machine name)
+    for code in ("<20>", "<00>"):
+        for line in text.splitlines():
+            m = re.match(r'\s*([^\s<].*?)\s+' + re.escape(code) + r'\s', line)
+            if m:
+                cand = m.group(1).strip()
+                if cand and cand != UNKNOWN_VALUE:
+                    name = cand
+                    break
+        if name:
+            break
+    mac = None
+    mm = re.search(r'(([0-9A-Fa-f]{2}-){5}[0-9A-Fa-f]{2})', text)
+    if mm and mm.group(1).upper() != "00-00-00-00-00-00":
+        mac = mm.group(1).upper()
+    return (name, mac)
+
+
+def measure_ping(ip: str, system: str) -> Tuple[bool, Optional[float]]:
+    """One ping → (success, latency_ms). On Windows this uses the IP Helper API
+    for sub-millisecond precision; everything else (and any Windows fallback)
+    parses `ping`/`ping.exe` output."""
+    if system == "Windows":
+        r = windows_icmp_ping(ip, WINDOWS_PING_TIMEOUT_MS)
+        if r is not None:
+            return r[0], r[1]
+        # else: fall through to the ping.exe fallback below
+
+    timeout_arg = WINDOWS_PING_TIMEOUT_MS if system == "Windows" else UNIX_PING_TIMEOUT_S
+    cmd = ["ping", "-n" if system == "Windows" else "-c", "1",
+           "-w" if system == "Windows" else "-W", str(timeout_arg), ip]
+    try:
+        res = _run(cmd, timeout=PING_TIMEOUT_SECONDS)
+    except Exception:
+        return (False, None)
+    if not ping_succeeded(res.returncode, res.stdout):
+        return (False, None)
+    m = (re.search(r'(?:time|zeit)\s*[=<]\s*([\d.]+)\s*ms', res.stdout, re.IGNORECASE)
+         or re.search(r'Minimum\s*=\s*([\d.]+)\s*ms', res.stdout, re.IGNORECASE))
+    return (True, float(m.group(1)) if m else None)
+
+
 def get_mac_address(ip: str, system: str, local_ip: str = None, local_mac: str = None) -> Optional[str]:
     """Get MAC address for an IP using ARP or local info."""
     if local_ip and ip == local_ip:
@@ -792,72 +1351,117 @@ def get_hostname(ip: str) -> Optional[str]:
         return None
 
 
-def load_previous_devices(output_dir: str = ".", gateway_mac: str = None) -> List[Device]:
-    """Load devices from previous scan files. Only includes devices whose router MAC
-    matches the current gateway MAC, so we only show offline devices from the same network."""
-    devices = []
-    scan_files = sorted(glob.glob(os.path.join(output_dir, "network_scan_*.txt")), reverse=True)
-    # Only use the most recent scan file
-    if not scan_files:
-        return devices
+# ═══════════════════════════════════════════════════════════════════════════════
+# KNOWN-DEVICES DATABASE (SQLite)
+# ═══════════════════════════════════════════════════════════════════════════════
+# A small SQLite store remembers every device ever seen on a network, keyed by the
+# network's gateway MAC. When the same router is recognised on a later scan, its
+# known devices are listed again — even the ones that are currently offline — and
+# the store is topped up with whatever the new scan found.
 
+def _db_connect(db_path: str):
+    """Open the known-devices DB, creating the schema on first use.
+    Returns None when sqlite3 is unavailable or the DB can't be opened
+    (the feature is then silently disabled — the app still runs fully)."""
     try:
-        with open(scan_files[0], 'r', encoding='utf-8') as f:
-            content = f.read()
-    except Exception:
-        return devices
-
-    # Find the gateway IP from the scan file header
-    file_gateway_ip = None
-    for line in content.split('\n'):
-        if 'Gateway:' in line:
-            gw_part = line.split('Gateway:')[1].strip().split()[0] if 'Gateway:' in line else None
-            if gw_part and re.match(r'\d+\.\d+\.\d+\.\d+', gw_part):
-                file_gateway_ip = gw_part
-            break
-
-    # Parse device lines from the scan file
-    # Format: "192.168.2.1        ONLINE       G2         unifi                          0,33ms         ..."
-    ip_pattern = re.compile(r'^(\d+\.\d+\.\d+\.\d+)\s+')
-    parsed_devices = []
-    gateway_mac_in_file = None
-
-    for line in content.split('\n'):
-        line = line.strip()
-        m = ip_pattern.match(line)
-        if not m:
-            continue
-        parts = line.split()
-        if len(parts) < 9:
-            continue
-
-        ip = parts[0]
-        status = parts[1]
-        # Group is parts[2]
-        # Find MAC (last field)
-        mac = parts[-1] if parts[-1] != 'Unknown' and re.match(r'([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}', parts[-1]) else None
-        hostname = parts[3] if len(parts) > 3 else UNKNOWN_VALUE
-
-        dev = Device(
-            ip=ip,
-            mac_address=mac.upper() if mac else UNKNOWN_VALUE,
-            hostname=hostname if hostname != 'Unknown' else UNKNOWN_VALUE,
-            ping_status=(status == STATUS_ONLINE),
-            target_pings=DEFAULT_PING_COUNT,
-            current_pings=DEFAULT_PING_COUNT,
-            is_offline=(status != STATUS_ONLINE)
+        import sqlite3  # lazy: keeps the exe from crashing when _sqlite3.pyd is missing
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS known_devices ("
+            " network_mac TEXT NOT NULL,"
+            " mac         TEXT NOT NULL,"
+            " ip          TEXT,"
+            " hostname    TEXT,"
+            " last_seen   TEXT,"
+            " PRIMARY KEY (network_mac, mac))"
         )
-        parsed_devices.append(dev)
+        return conn
+    except Exception:
+        return None
 
-        # Track gateway MAC from file
-        if file_gateway_ip and ip == file_gateway_ip and mac:
-            gateway_mac_in_file = mac.upper()
 
-    # Only include devices if the gateway MAC matches (same network)
-    if gateway_mac and gateway_mac_in_file and gateway_mac != gateway_mac_in_file:
-        return []  # Different network — don't merge
+def save_known_devices(db_path: str, network_mac: str, devices: List[Device],
+                       timestamp: str) -> None:
+    """Upsert every device that has a real MAC into the DB for this network."""
+    if not network_mac:
+        return
+    conn = _db_connect(db_path)
+    if conn is None:
+        return
+    try:
+        with conn:
+            for d in devices:
+                if not d.mac_address or d.mac_address == UNKNOWN_VALUE:
+                    continue
+                # Skip entries without a plausible IPv4 address (e.g. "Unknown")
+                parts = (d.ip or "").split('.')
+                if len(parts) != IP_OCTET_COUNT or not all(p.isdigit() for p in parts):
+                    continue
+                mac = d.mac_address.upper()
+                hostname = d.hostname if (d.hostname and d.hostname != UNKNOWN_VALUE) else None
+                conn.execute(
+                    "INSERT INTO known_devices (network_mac, mac, ip, hostname, last_seen)"
+                    " VALUES (?, ?, ?, ?, ?)"
+                    " ON CONFLICT(network_mac, mac) DO UPDATE SET"
+                    "   ip=excluded.ip,"
+                    "   hostname=COALESCE(excluded.hostname, known_devices.hostname),"
+                    "   last_seen=excluded.last_seen",
+                    (network_mac.upper(), mac, d.ip, hostname, timestamp)
+                )
+    except Exception:
+        pass
+    finally:
+        conn.close()
 
-    return parsed_devices
+
+def load_known_devices(db_path: str, network_mac: str) -> List[Device]:
+    """Return all devices remembered for the given network (by gateway MAC),
+    marked as offline/from_db so callers can show them even when unreachable."""
+    if not network_mac or not os.path.isfile(db_path):
+        return []
+    conn = _db_connect(db_path)
+    if conn is None:
+        return []
+    try:
+        rows = conn.execute(
+            "SELECT ip, mac, hostname FROM known_devices WHERE network_mac = ?",
+            (network_mac.upper(),)
+        ).fetchall()
+    except Exception:
+        rows = []
+    finally:
+        conn.close()
+    result = []
+    for ip, mac, hostname in rows:
+        result.append(Device(
+            ip=ip or UNKNOWN_VALUE,
+            mac_address=mac.upper() if mac else UNKNOWN_VALUE,
+            hostname=hostname if hostname else UNKNOWN_VALUE,
+            ping_status=False, is_offline=True, from_db=True
+        ))
+    return result
+
+
+def _get_network_mac_from_db(db_path: str, gateway_ip: str) -> Optional[str]:
+    """Return the network_mac (= gateway MAC) that the DB has recorded for
+    `gateway_ip`, or None when this network has never been seen before.
+    The gateway is the one device whose MAC equals the network_mac key."""
+    if not gateway_ip or not os.path.isfile(db_path):
+        return None
+    conn = _db_connect(db_path)
+    if conn is None:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT network_mac FROM known_devices"
+            " WHERE ip = ? AND mac = network_mac LIMIT 1",
+            (gateway_ip,)
+        ).fetchone()
+        return row[0] if row else None
+    except Exception:
+        return None
+    finally:
+        conn.close()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -875,12 +1479,17 @@ def format_num(n: int) -> str:
 
 
 def format_float(n: float) -> str:
-    """Format float with dot as thousands separator and comma as decimal."""
+    """Format a ping value: dot thousands separator, comma decimals, 'ms' suffix.
+    A whole number drops the ',00' decimals entirely (e.g. 5ms, not 5,00ms)."""
     if n is None:
         return UNKNOWN_VALUE
-    formatted = f"{n:,.2f}"
-    parts = formatted.split('.')
-    return f"{parts[0].replace(',', '.')},{parts[1]}ms"
+    int_part, dec_part = f"{n:,.2f}".split('.')
+    int_part = int_part.replace(',', '.')
+    # Drop trailing zero(s): '00' → '' (5ms), '50' → '5' (1,5ms), '05' stays.
+    dec_part = dec_part.rstrip('0')
+    if not dec_part:
+        return f"{int_part}ms"
+    return f"{int_part},{dec_part}ms"
 
 
 def format_cell(text: str, width: int) -> str:
@@ -896,6 +1505,52 @@ def format_cell_center(text: str, width: int) -> str:
     left = pad // 2
     right = pad - left
     return (" " * left) + text + (" " * right)
+
+
+def _pad_vis(text: str, width: int) -> str:
+    """Right-pad text with spaces to a visible width (ANSI-aware)."""
+    return text + " " * max(0, width - get_visible_len(text))
+
+
+def _lpad_vis(text: str, width: int) -> str:
+    """Left-pad text with spaces to a visible width (ANSI-aware) — right-aligns it."""
+    return " " * max(0, width - get_visible_len(text)) + text
+
+
+def kv_block_rows(lab0: str, val0: str, lab1: str, val1: str) -> Tuple[str, str]:
+    """Format a two-line label/value block: labels left-aligned, values
+    right-aligned, with exactly one space between the longest label and the
+    value column. ANSI-aware, so colour codes don't break the alignment.
+    Labels are expected to already include their trailing ':'."""
+    label_w = max(get_visible_len(lab0), get_visible_len(lab1))
+    val_w   = max(get_visible_len(val0), get_visible_len(val1))
+    row0 = _pad_vis(lab0, label_w) + " " + _lpad_vis(val0, val_w)
+    row1 = _pad_vis(lab1, label_w) + " " + _lpad_vis(val1, val_w)
+    return row0, row1
+
+
+def truncate_host(host: str, width: int) -> str:
+    """Truncate a hostname to fit `width` characters, ending with '..' when cut.
+    Guarantees the result is never longer than `width`, so it can never push the
+    following table columns out of alignment."""
+    if len(host) <= width:
+        return host
+    return host[:max(0, width - 2)] + ".."
+
+
+def _assemble_row(segments: List[Tuple[int, str]]) -> str:
+    """Place (start_col, text) segments on one line, filling gaps with spaces.
+    start_col is a visible column; text may contain ANSI codes. Segments that
+    would overlap are simply concatenated (caller is responsible for spacing)."""
+    line = ""
+    cur = 0
+    for start, text in sorted(segments, key=lambda s: s[0]):
+        if start > cur:
+            line += " " * (start - cur)
+            cur = start
+        line += text
+        cur += get_visible_len(text)
+    return line
 
 
 def colorize_ping(avg_ms: float) -> Tuple[str, str]:
@@ -933,13 +1588,13 @@ def colorize_ip(ip: str) -> str:
 
 
 def colorize_local_ip(ip: str) -> str:
-    """Highlight the local/scanner IP in red."""
-    return f"{COLOR_RED}{ip}{COLOR_RESET}"
+    """The local/scanner IP uses the same magenta as the hostnames."""
+    return f"{COLOR_MAGENTA}{ip}{COLOR_RESET}"
 
 
 def colorize_local_hostname(name: str) -> str:
-    """Highlight the local/scanner hostname in red."""
-    return f"{COLOR_RED}{name}{COLOR_RESET}"
+    """The local/scanner hostname uses the same magenta as the other hostnames."""
+    return f"{COLOR_MAGENTA}{name}{COLOR_RESET}"
 
 
 def colorize_mac(mac: str) -> str:
@@ -958,6 +1613,93 @@ def colorize_header(text: str) -> str:
     return f"{COLOR_ORANGE}{text}{COLOR_RESET}"
 
 
+# ── MAC → Vendor (OUI) lookup ────────────────────────────────────────────────
+# Curated subset of IEEE OUI assignments covering common consumer/office gear.
+# Key = first three octets (uppercase, colon-separated). Value = short vendor.
+MAC_VENDOR_PREFIXES: Dict[str, str] = {
+    # Apple
+    "00:03:93": "Apple", "00:0A:27": "Apple", "00:1B:63": "Apple",
+    "00:1E:C2": "Apple", "00:25:00": "Apple", "00:26:BB": "Apple",
+    "3C:07:54": "Apple", "A4:C3:61": "Apple", "AC:BC:32": "Apple",
+    "DC:A9:04": "Apple", "F0:18:98": "Apple", "F4:0F:24": "Apple",
+    "F8:1E:DF": "Apple", "88:66:A5": "Apple", "B8:E8:56": "Apple",
+    # Samsung
+    "00:12:FB": "Samsung", "00:15:99": "Samsung", "00:1D:25": "Samsung",
+    "08:08:C2": "Samsung", "10:30:47": "Samsung", "34:23:87": "Samsung",
+    "5C:0A:5B": "Samsung", "78:1F:DB": "Samsung", "B8:5E:7B": "Samsung",
+    # Intel
+    "00:1B:21": "Intel", "00:1E:67": "Intel", "3C:97:0E": "Intel",
+    "7C:5C:F8": "Intel", "8C:16:45": "Intel", "A0:88:69": "Intel",
+    "DC:53:60": "Intel", "94:65:9C": "Intel",
+    # Cisco / Cisco-Meraki
+    "00:00:0C": "Cisco", "00:1A:A1": "Cisco", "00:25:9C": "Cisco",
+    "E0:55:3D": "Cisco", "00:18:0A": "Cisco Meraki", "88:15:44": "Cisco Meraki",
+    # TP-Link
+    "00:27:19": "TP-Link", "14:CC:20": "TP-Link", "50:C7:BF": "TP-Link",
+    "A4:2B:B0": "TP-Link", "C0:06:C3": "TP-Link", "EC:08:6B": "TP-Link",
+    # Ubiquiti
+    "00:15:6D": "Ubiquiti", "04:18:D6": "Ubiquiti", "24:5A:4C": "Ubiquiti",
+    "78:8A:20": "Ubiquiti", "B4:FB:E4": "Ubiquiti", "FC:EC:DA": "Ubiquiti",
+    # AVM (FritzBox)
+    "00:04:0E": "AVM FritzBox", "00:1C:4A": "AVM FritzBox", "08:96:D7": "AVM FritzBox",
+    "2C:3A:FD": "AVM FritzBox", "38:10:D5": "AVM FritzBox", "C0:25:06": "AVM FritzBox",
+    # Google / Nest
+    "00:1A:11": "Google", "3C:5A:B4": "Google", "54:60:09": "Google",
+    "F4:F5:D8": "Google", "F4:F5:E8": "Google", "DA:A1:19": "Google",
+    # Amazon
+    "00:FC:8B": "Amazon", "0C:47:C9": "Amazon", "44:65:0D": "Amazon",
+    "68:37:E9": "Amazon", "74:75:48": "Amazon", "FC:65:DE": "Amazon",
+    # Raspberry Pi
+    "28:CD:C1": "Raspberry Pi", "B8:27:EB": "Raspberry Pi",
+    "DC:A6:32": "Raspberry Pi", "E4:5F:01": "Raspberry Pi",
+    # Espressif (ESP32/ESP8266 IoT)
+    "24:0A:C4": "Espressif", "30:AE:A4": "Espressif", "5C:CF:7F": "Espressif",
+    "84:CC:A8": "Espressif", "A0:20:A6": "Espressif", "EC:FA:BC": "Espressif",
+    # Huawei
+    "00:E0:FC": "Huawei", "48:46:FB": "Huawei", "70:72:3C": "Huawei",
+    "AC:E2:15": "Huawei", "F4:8C:50": "Huawei",
+    # Xiaomi
+    "28:6C:07": "Xiaomi", "50:8F:4C": "Xiaomi", "64:09:80": "Xiaomi",
+    "78:11:DC": "Xiaomi", "F8:A4:5F": "Xiaomi",
+    # Dell / HP / Lenovo / Microsoft
+    "00:14:22": "Dell", "18:03:73": "Dell", "B8:CA:3A": "Dell",
+    "00:1B:78": "HP", "3C:D9:2B": "HP", "70:5A:0F": "HP",
+    "00:21:CC": "Lenovo", "54:EE:75": "Lenovo",
+    "00:15:5D": "Microsoft", "28:18:78": "Microsoft", "7C:1E:52": "Microsoft",
+    # Sonos / Philips Hue / AVM smart home
+    "00:0E:58": "Sonos", "5C:AA:FD": "Sonos", "94:9F:3E": "Sonos",
+    "00:17:88": "Philips Hue", "EC:B5:FA": "Philips Hue",
+    # Netgear / D-Link / ASUS
+    "00:09:5B": "Netgear", "20:E5:2A": "Netgear", "A0:40:A0": "Netgear",
+    "00:1B:11": "D-Link", "1C:BD:B9": "D-Link",
+    "00:1B:FC": "ASUS", "2C:56:DC": "ASUS", "AC:9E:17": "ASUS",
+}
+
+
+def lookup_mac_vendor(mac: Optional[str]) -> Optional[str]:
+    """Return the manufacturer for a MAC address via its OUI prefix, or None."""
+    if not mac or mac == UNKNOWN_VALUE:
+        return None
+    parts = mac.replace('-', ':').upper().split(':')
+    if len(parts) < 3:
+        return None
+    return MAC_VENDOR_PREFIXES.get(":".join(parts[:3]))
+
+
+def resolve_hostname_display(hostname: Optional[str], mac: Optional[str]) -> Tuple[str, str]:
+    """Decide what to show in the Hostname column and how to colour it.
+    Returns (text, kind) where kind ∈ {'known', 'vendor', 'unknown'}.
+      known  → real hostname  (magenta / red-if-local)
+      vendor → MAC manufacturer (yellow)
+      unknown→ literal 'Unknown' (gray)"""
+    if hostname and hostname != UNKNOWN_VALUE:
+        return hostname, 'known'
+    vendor = lookup_mac_vendor(mac)
+    if vendor:
+        return vendor, 'vendor'
+    return UNKNOWN_VALUE, 'unknown'
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # LIVE TABLE
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -973,44 +1715,120 @@ class LiveTable:
         self.current_phase, self.pings_per_device = "Initializing", 0
         self.phase_number = 0
         self.total_pings_completed, self.total_pings_target = 0, 0
+        # Per-ping outcome counters — used for the coloured progress bar
+        self.ping_success = 0
+        self.ping_failed  = 0
+        self.ping_skipped = 0
         self.table_width = TABLE_WIDTH
         self.public_latencies = {}
         self.network_info = {}  # Set via set_network_info()
+        self.scanned_subnets: List[str] = []  # CIDRs shown next to the title
+        self.active_threads = 0  # Live count of in-flight ping workers
         self.local_ip = None
         self.gateway_ip = None
         self.gateway_color = GROUP_GATEWAY_COLOR_DEFAULT
-        self._needs_render = False
+        self.paused = False        # set by the input listener; drives the footer hint
+        self.is_infinite = False   # ∞ mode: pings run until the user stops the scan
+        self.known_network = False # True when the DB recognised this network's gateway
         self._refresh_timer = None
         self._refresh_stop = threading.Event()
+        self._render_event = threading.Event()  # set by each ping to trigger a redraw
 
         if platform.system() == "Windows":
             _enable_windows_ansi()
-        # Resize: width = table + small margin, height = max screen height
+        # The device table has a FIXED width (TABLE_WIDTH); the framing borders
+        # must match it, so the screen is widened to fit rather than the table
+        # being shrunk below the content (which would let rows poke past the
+        # borders). table_width therefore stays >= TABLE_WIDTH.  rows=0 → the
+        # window grows to the FULL screen height that fits at the current font.
         _resize_terminal(TABLE_WIDTH + 2)
+        self.table_width = TABLE_WIDTH
+        # Centre the (now full-height) console window on the primary monitor.
+        _center_console_window()
+
+    def set_paused(self, value: bool) -> None:
+        """Flag the paused state so the footer shows the pause/controls hint."""
+        with self.lock:
+            self.paused = value
+        self.request_render()
+
+    def set_infinite(self, value: bool) -> None:
+        with self.lock:
+            self.is_infinite = value
+
+    def _required_width_locked(self) -> int:
+        """Width the header layout needs: bars + centred stats + right-aligned
+        network info (IP/MASK | GW/DNS). Uses worst-case counts so the width is
+        stable for the whole scan (no mid-scan reflow)."""
+        ni = self.network_info
+        ip_str   = ni.get('ip',          UNKNOWN_VALUE) or UNKNOWN_VALUE
+        mask_str = ni.get('subnet_mask', UNKNOWN_VALUE) or UNKNOWN_VALUE
+        gw_str   = ni.get('gateway',     UNKNOWN_VALUE) or UNKNOWN_VALUE
+        dns_str  = ni.get('dns_servers', [UNKNOWN_VALUE])[0] if ni.get('dns_servers') else UNKNOWN_VALUE
+        big = format_num(self.total_count or 0)
+        onoff_w = max(len(f"Online: {big}"), len(f"Offline: {big}"))
+        uf_w    = max(len(f"Used: {big}"),   len(f"Free: {big}"))
+        stats_w = onoff_w + 2 + uf_w
+        ipmask_w = max(len(f"IP: {ip_str}"),  len(f"MASK: {mask_str}"))
+        gwdns_w  = max(len(f"GW: {gw_str}"),  len(f"DNS: {dns_str}"))
+        net_w = ipmask_w + 2 + gwdns_w
+        pings = format_num(self.total_pings_target or self.total_count or 0)
+        count_w = max(len(f"{big}/{big}"), len(f"{pings}/{pings}"))
+        bar_region = len("Devices:") + PROGRESS_BAR_MAX_LEN + 1 + count_w
+        return bar_region + HEADER_INFO_GAP + stats_w + HEADER_INFO_GAP + net_w
+
+    def fit_width(self) -> None:
+        """Grow the console window + table_width so the header layout never wraps
+        (request: widen the window dynamically when the view is too wide). Only
+        ever grows — never shrinks below the base TABLE_WIDTH."""
+        with self.lock:
+            needed = max(TABLE_WIDTH, self._required_width_locked())
+            current = self.table_width
+        if needed <= current:
+            return
+        # Widen the console to fit; keep the border (table_width) at the content
+        # width even if the console can't grow that far, so rows never poke past
+        # the borders (they wrap together instead).
+        _resize_terminal(needed + 2)
+        with self.lock:
+            self.table_width = needed
+        # Re-centre: the window just changed width, so its old centred position is
+        # now off to the left. Keep it centred on the primary monitor.
+        _center_console_window()
+
+    def request_render(self):
+        """Signal the refresh thread to redraw promptly (called on every ping)."""
+        self._render_event.set()
 
     def start_refresh_timer(self):
-        """Start a background thread that triggers periodic renders."""
+        """Start the single render thread. It redraws as soon as a ping requests
+        it (live), but never more often than LIVE_RENDER_MIN_INTERVAL, and at
+        least every render_throttle seconds as a heartbeat (keeps the spinner
+        animating while idle). A single renderer avoids garbled output from many
+        worker threads writing at once."""
         if self._refresh_timer is not None:
             return
         def _timer_loop():
             while not self._refresh_stop.is_set():
-                self._refresh_stop.wait(timeout=self.render_throttle)
-                if not self._refresh_stop.is_set():
-                    self._render(force=True)
+                # Wake on a ping request, or fall back to the heartbeat interval.
+                self._render_event.wait(timeout=self.render_throttle)
+                if self._refresh_stop.is_set():
+                    break
+                self._render_event.clear()
+                self._render(force=True)
+                # Coalesce bursts: cap the redraw rate so many threads pinging at
+                # once don't cause flicker.
+                self._refresh_stop.wait(timeout=LIVE_RENDER_MIN_INTERVAL)
         self._refresh_stop.clear()
+        self._render_event.clear()
         self._refresh_timer = threading.Thread(target=_timer_loop, daemon=True)
         self._refresh_timer.start()
 
     def stop_refresh_timer(self):
-        """Stop the periodic refresh timer."""
+        """Stop the render thread (wake it immediately so it exits without delay)."""
         self._refresh_stop.set()
+        self._render_event.set()
         self._refresh_timer = None
-
-    def _try_render(self):
-        """Render only if enough time has passed since last render (throttled)."""
-        now = time.time()
-        if now - self.last_render_time >= self.render_throttle:
-            self._render(force=True)
 
     def set_gateway(self, ip: str):
         self.gateway_ip = ip
@@ -1046,7 +1864,6 @@ class LiveTable:
         Hostname patterns take priority. Devices sharing a MAC prefix with
         an already-grouped device join that group even if hostnames differ."""
         with self.lock:
-            random.shuffle(GROUP_DYNAMIC_COLORS)
             self._resolve_gateway_color()
             gateway_color = self.gateway_color
             reserved = {GROUP_UNKNOWN_COLOR, gateway_color}
@@ -1099,7 +1916,7 @@ class LiveTable:
                             if host_base in patterns:
                                 d.group_id = patterns[host_base]
                             else:
-                                while current_id - GROUP_ID_DYNAMIC_START < len(GROUP_DYNAMIC_COLORS) and GROUP_DYNAMIC_COLORS[(current_id - GROUP_ID_DYNAMIC_START) % len(GROUP_DYNAMIC_COLORS)] in reserved:
+                                while current_id - GROUP_ID_DYNAMIC_START < len(GROUP_COLOR_SEQUENCE) and GROUP_COLOR_SEQUENCE[(current_id - GROUP_ID_DYNAMIC_START) % len(GROUP_COLOR_SEQUENCE)] in reserved:
                                     current_id += 1
                                 patterns[host_base] = current_id
                                 d.group_id = current_id
@@ -1113,7 +1930,7 @@ class LiveTable:
                         if mac_key in patterns:
                             d.group_id = patterns[mac_key]
                         else:
-                            while current_id - GROUP_ID_DYNAMIC_START < len(GROUP_DYNAMIC_COLORS) and GROUP_DYNAMIC_COLORS[(current_id - GROUP_ID_DYNAMIC_START) % len(GROUP_DYNAMIC_COLORS)] in reserved:
+                            while current_id - GROUP_ID_DYNAMIC_START < len(GROUP_COLOR_SEQUENCE) and GROUP_COLOR_SEQUENCE[(current_id - GROUP_ID_DYNAMIC_START) % len(GROUP_COLOR_SEQUENCE)] in reserved:
                                 current_id += 1
                             patterns[mac_key] = current_id
                             d.group_id = current_id
@@ -1139,7 +1956,7 @@ class LiveTable:
         with self.lock:
             self.public_latencies[p] = s
 
-    def update_device(self, device: Device, force_render: bool = False):
+    def update_device(self, device: Device):
         with self.lock:
             if device.ip not in self.devices:
                 self.devices[device.ip] = Device(
@@ -1152,7 +1969,8 @@ class LiveTable:
                     current_pings=device.current_pings,
                     target_pings=device.target_pings,
                     group_id=device.group_id,
-                    is_offline=device.is_offline
+                    is_offline=device.is_offline,
+                    last_ping=device.last_ping
                 )
             else:
                 o = self.devices[device.ip]
@@ -1161,23 +1979,96 @@ class LiveTable:
                     o.is_offline = False  # Once online, no longer offline
                 if device.latency_ms is not None:
                     o.latency_ms = device.latency_ms
+                if device.last_ping is not None:
+                    o.last_ping = device.last_ping
                 if device.ping_stats:
                     o.ping_stats.update(device.ping_stats)
-                if device.mac_address != UNKNOWN_VALUE:
+                # Only overwrite with a *genuine* new value. get_mac_address /
+                # get_hostname return None on failure (common for devices in an
+                # additional/routed subnet), and None != UNKNOWN_VALUE — so the
+                # old condition wiped good discovery data on a flaky re-ping.
+                if device.mac_address and device.mac_address != UNKNOWN_VALUE:
                     o.mac_address = device.mac_address
-                if device.hostname != UNKNOWN_VALUE:
+                if device.hostname and device.hostname != UNKNOWN_VALUE:
                     o.hostname = device.hostname
                 o.current_pings = device.current_pings
                 o.target_pings = device.target_pings
+        self.request_render()   # live redraw when a device's ping data changes
 
-    def set_completed(self, count, force_render: bool = False):
+    def bump_completed(self, n: int = 1) -> None:
+        """Atomically mark n more devices as fully processed (pipeline mode)."""
         with self.lock:
-            self.completed_count = count
+            self.completed_count = min(self.total_count, self.completed_count + n)
+        self.request_render()
 
-    def set_total_pings(self, completed: int, target: int):
+    def set_total_pings(self, target: int):
+        """Set the total ping target. Completion is tracked via record_ping/record_skipped."""
         with self.lock:
-            self.total_pings_completed = completed
             self.total_pings_target = target
+
+    def record_ping(self, success: bool) -> None:
+        """Record one ping outcome; updates completion counters atomically."""
+        with self.lock:
+            if success:
+                self.ping_success += 1
+            else:
+                self.ping_failed += 1
+            self.total_pings_completed = self.ping_success + self.ping_failed + self.ping_skipped
+        self.request_render()   # live redraw after each ping
+
+    def record_skipped(self, n: int) -> None:
+        """Record n pings that were skipped (offline device or 5-fail rule)."""
+        if n <= 0:
+            return
+        with self.lock:
+            self.ping_skipped += n
+            self.total_pings_completed = self.ping_success + self.ping_failed + self.ping_skipped
+        self.request_render()   # live redraw when pings are skipped
+
+    @staticmethod
+    def _overlay_center(chars: List[str], center_text: str, pb_len: int) -> str:
+        """Overlay center_text (bold white) onto the middle of a bar's cell list
+        and join it into a single string. Used by every progress bar so a bar at
+        0% still shows its '0%'/∞ label on the empty outline."""
+        start = (pb_len - len(center_text)) // 2
+        for i, ch in enumerate(center_text):
+            pos = start + i
+            if 0 <= pos < pb_len:
+                chars[pos] = f"{COLOR_BOLD}{COLOR_WHITE}{ch}{COLOR_RESET}"
+        return "".join(chars)
+
+    def _build_ping_bar(self, pb_len: int, center_text: str) -> str:
+        """Coloured ping progress bar:
+          green  █ = successful pings
+          red    █ = failed pings
+          gray   █ = skipped (offline discovery / 5-fail rule)
+          dark   ░ = not yet attempted
+        """
+        total = self.total_pings_target
+        if total <= 0:
+            # No target yet (startup) or ∞ mode → empty outline, label still shown.
+            chars = [f"{COLOR_DARK_GRAY}░{COLOR_RESET}"] * pb_len
+            return self._overlay_center(chars, center_text, pb_len)
+
+        def _blocks(count: int) -> int:
+            return max(0, round(pb_len * count / total))
+
+        s = _blocks(self.ping_success)
+        f = _blocks(self.ping_failed)
+        k = _blocks(self.ping_skipped)
+        # Clamp so rounding never pushes us past pb_len
+        s = min(s, pb_len)
+        f = min(f, pb_len - s)
+        k = min(k, pb_len - s - f)
+        r = pb_len - s - f - k
+
+        chars = (
+            [f"\033[92m█{COLOR_RESET}"] * s +        # bright green  — success
+            [f"\033[91m█{COLOR_RESET}"] * f +        # bright red    — failed
+            [f"\033[90m█{COLOR_RESET}"] * k +        # dark gray blk — skipped
+            [f"{COLOR_DARK_GRAY}░{COLOR_RESET}"] * r # outline       — remaining
+        )
+        return self._overlay_center(chars, center_text, pb_len)
 
     def set_phase(self, ph: str, pi: int):
         with self.lock:
@@ -1191,14 +2082,70 @@ class LiveTable:
             self.phase_number = phase_map.get(ph, 0)
 
     def _build_bar(self, pb_len: int, filled: int, center_text: str) -> str:
-        """Build a progress bar with centered text."""
-        pct_start = (pb_len - len(center_text)) // 2
-        chars = [f"{COLOR_GREEN}█{COLOR_RESET}" if i < filled else f"{COLOR_DARK_GRAY}░{COLOR_RESET}" for i in range(pb_len)]
-        for i, ch in enumerate(center_text):
-            pos = pct_start + i
-            if pos < pb_len:
-                chars[pos] = f"{COLOR_BOLD}{COLOR_WHITE}{ch}{COLOR_RESET}"
-        return "".join(chars)
+        """Build a simple two-tone progress bar with centered text (file output)."""
+        chars = [f"{COLOR_GREEN}█{COLOR_RESET}" if i < filled else f"{COLOR_DARK_GRAY}░{COLOR_RESET}"
+                 for i in range(pb_len)]
+        return self._overlay_center(chars, center_text, pb_len)
+
+    def _build_devices_bar(self, pb_len: int, center_text: str) -> str:
+        """Devices progress bar coloured by device status:
+          green  █ = online   (responded this scan)
+          gray   █ = unknown   (processed, neither online nor identified-offline)
+          gray   █ = offline   (identified device that did not respond)
+          dark   ░ = not yet processed
+        Fully filled once every device has been processed."""
+        total = self.total_count
+        if total == 0:
+            chars = [f"{COLOR_DARK_GRAY}░{COLOR_RESET}"] * pb_len
+            return self._overlay_center(chars, center_text, pb_len)
+
+        online  = sum(1 for d in self.devices.values() if d.ping_status)
+        offline = sum(1 for d in self.devices.values() if not d.ping_status and (
+            (d.mac_address and d.mac_address != UNKNOWN_VALUE) or
+            (d.hostname   and d.hostname   != UNKNOWN_VALUE)
+        ))
+        completed = min(max(self.completed_count, online + offline), total)
+        unknown   = max(0, completed - online - offline)
+
+        def _blocks(count: int) -> int:
+            return max(0, round(pb_len * count / total))
+
+        g = _blocks(online)
+        y = _blocks(unknown)
+        k = _blocks(offline)
+        # Clamp so rounding never exceeds pb_len
+        g = min(g, pb_len)
+        y = min(y, pb_len - g)
+        k = min(k, pb_len - g - y)
+        r = pb_len - g - y - k
+
+        chars = (
+            [f"\033[92m█{COLOR_RESET}"] * g +         # bright green  — online
+            [f"\033[90m█{COLOR_RESET}"] * y +         # dark gray blk — unknown
+            [f"\033[90m█{COLOR_RESET}"] * k +         # dark gray blk — offline
+            [f"{COLOR_DARK_GRAY}░{COLOR_RESET}"] * r  # outline       — pending
+        )
+        return self._overlay_center(chars, center_text, pb_len)
+
+    def finalize_progress(self) -> None:
+        """Force both progress bars to 100% at the end of a scan.
+        Tops up skipped pings to the target and marks all devices processed,
+        so neither bar shows a partial fill due to rounding/early-exit."""
+        with self.lock:
+            if self.total_pings_target > 0:
+                done = self.ping_success + self.ping_failed + self.ping_skipped
+                remaining = self.total_pings_target - done
+                if remaining > 0:
+                    self.ping_skipped += remaining
+                self.total_pings_completed = self.total_pings_target
+            self.completed_count = self.total_count
+
+    def _internet_avg(self) -> Optional[float]:
+        """Overall average latency across all tested internet hosts (mean of each
+        host's average), or None when no internet host has a result yet."""
+        avgs = [s.get('avg') for s in self.public_latencies.values()
+                if s.get('avg') is not None]
+        return sum(avgs) / len(avgs) if avgs else None
 
     def _get_statistics_lines(self, devices: List[Device], colors: bool = True) -> List[str]:
         """Return the Internet hosts section arranged horizontally, 2 lines per host."""
@@ -1237,134 +2184,161 @@ class LiveTable:
             col_widths.append(max(get_visible_len(entry), get_visible_len(minmax)))
 
         if row1_parts:
-            row1 = ""
-            row2 = ""
+            gap = "  "  # spacing between host columns
+            row1_cols, row2_cols = [], []
             for i, (entry, minmax) in enumerate(zip(row1_parts, row2_parts)):
-                gap = 2  # spacing between columns
                 w = col_widths[i]
-                entry_pad = w - get_visible_len(entry)
-                minmax_pad = w - get_visible_len(minmax)
-                row1 += "  " + entry + " " * entry_pad + " " * gap
-                row2 += "  " + minmax + " " * minmax_pad + " " * gap
-            # Center both rows within the table width
-            row1_vis = get_visible_len(row1)
-            row2_vis = get_visible_len(row2)
-            max_vis = max(row1_vis, row2_vis)
-            r1_pad = max(0, (self.table_width - max_vis) // 2)
-            r2_pad = max(0, (self.table_width - row2_vis) // 2)
-            lines.append(" " * r1_pad + row1)
-            lines.append(" " * r2_pad + row2)
+                row1_cols.append(entry + " " * (w - get_visible_len(entry)))
+                row2_cols.append(minmax + " " * (w - get_visible_len(minmax)))
+            row1 = gap.join(row1_cols)
+            row2 = gap.join(row2_cols)
+            # Center both rows on the SAME origin so columns stay aligned,
+            # then strip trailing spaces so the line never reaches the console
+            # width (a full-width line auto-wraps and looks like a blank line).
+            max_vis = max(get_visible_len(row1), get_visible_len(row2))
+            pad = max(0, (self.table_width - max_vis) // 2)
+            lines.append((" " * pad + row1).rstrip())
+            lines.append((" " * pad + row2).rstrip())
         else:
             lines.append(f"  {COLOR_DARK_GRAY}No internet hosts tested{COLOR_RESET}")
 
         return lines
 
-    def _render_internal(self, move_home: bool = True):
+    def _render_internal(self, clear_first: bool = False):
         with self.lock:
-            return self._render_internal_locked(move_home=move_home)
+            return self._render_internal_locked(clear_first=clear_first)
 
-    def _render_internal_locked(self, move_home: bool = True):
+    def _render_internal_locked(self, clear_first: bool = False):
         output = []
-        if move_home:
-            output.append("\033[2J\033[H")  # Clear screen and move cursor home
         output.append(f"{COLOR_BLUE}{'=' * self.table_width}{COLOR_RESET}")
         # Title always centered in table width, phase on the left (indented 8 chars)
         phi = f"{COLOR_CYAN}{self.phase_number}{COLOR_RESET} - {COLOR_BRIGHT_WHITE}{self.current_phase}"
-        if self.pings_per_device > 0:
+        if self.pings_per_device == PING_COUNT_INFINITE:
+            phi += f" ({INFINITE_SYMBOL} pings)"
+        elif self.pings_per_device > 0:
             phi += f" ({format_num(self.pings_per_device)} pings)"
         phi += COLOR_RESET
         title_color = random.choice(TITLE_COLORS)
         title = f"\033[1;38;5;{title_color}mNetwork Scanner{COLOR_RESET}"
         title_visible = "Network Scanner"
-        # Phase left-aligned with 8 spaces indent, title centered in full table width
-        phase_indent = 8
-        title_pad = (self.table_width - len(title_visible)) // 2
-        phase_prefix = f"{' ' * phase_indent}{phi}"
-        phase_vis_len = phase_indent + get_visible_len(phi)
-        min_title_start = phase_vis_len + 2
-        title_start = max(title_pad, min_title_start)
-        left_spaces = max(0, title_start - phase_vis_len)
-        output.append(f"{phase_prefix}{' ' * left_spaces}{title}")
+        # Loading symbol left of the phase: a random char in a random colour on
+        # every redraw (a glitchy "still working" indicator).
+        spin_char = random.choice(SPINNER_CHARS)
+        spin_color = random.choice(TITLE_COLORS)
+        spinner = f"\033[1;38;5;{spin_color}m{spin_char}{COLOR_RESET}"
+        phase_prefix = f"   {spinner}   {phi}"
+        phase_vis_len = get_visible_len(phase_prefix)
 
-        # Progress bars
-        # Pings bar
-        ping_bar_str = ""
-        if self.total_pings_target > 0:
-            pb_len = PROGRESS_BAR_MAX_LEN
-            pct = (self.total_pings_completed / self.total_pings_target) * 100
-            filled = int(pb_len * pct / 100)
-            pct_text = f"{pct:.0f}%"
-            ping_bar_str = f"{COLOR_CYAN}Pings:  {COLOR_RESET}{self._build_bar(pb_len, filled, pct_text)}{COLOR_RESET} {COLOR_BLUE}{format_num(self.total_pings_completed)}/{format_num(self.total_pings_target)}{COLOR_RESET}"
+        # Known-network indicator: coloured ███ in gateway group color shown at
+        # the right of the title line when the DB recognised this network.
+        subnets_block = ""
+        subnets_vis = 0
+        if self.known_network:
+            kn = f"\033[38;5;{self.gateway_color}m███{COLOR_RESET} "
+            subnets_block = kn
+            subnets_vis = get_visible_len(kn)
+        if self.scanned_subnets:
+            subnets_text = ", ".join(self.scanned_subnets)
+            nets = f"{COLOR_CYAN}Subnets:{COLOR_RESET} {COLOR_BRIGHT_WHITE}{subnets_text}{COLOR_RESET}"
+            subnets_block += nets
+            subnets_vis += get_visible_len(nets)
 
-        # Devices bar
-        dev_bar_str = ""
+        # Centre the title in the space left between the phase and the right block
+        right_limit = self.table_width - subnets_vis - (2 if subnets_vis else 0)
+        title_start = max(phase_vis_len + 2, (self.table_width - len(title_visible)) // 2)
+        if title_start + len(title_visible) > right_limit:
+            title_start = max(phase_vis_len + 2, right_limit - len(title_visible))
+        line = phase_prefix + " " * max(0, title_start - phase_vis_len) + title
+        if subnets_block:
+            cur = title_start + len(title_visible)
+            gap = max(2, self.table_width - subnets_vis - cur)
+            line += " " * gap + subnets_block
+        output.append(line)
+
+        # ── Threads row, above the bars, right-aligned to the bar's end ───────
+        bar_end_col = len("Pings:  ") + PROGRESS_BAR_MAX_LEN
+        thr_value = format_num(self.active_threads)
+        thr_lead = max(0, bar_end_col - len(f"Threads: {thr_value}"))
+        output.append(
+            " " * thr_lead
+            + f"{COLOR_CYAN}Threads: {COLOR_RESET}{COLOR_BRIGHT_WHITE}{thr_value}{COLOR_RESET}"
+        )
+
+        # ── Progress bars (always drawn; at 0 they show an empty outline) ─────
+        pb_len = PROGRESS_BAR_MAX_LEN
+        done = self.ping_success + self.ping_failed + self.ping_skipped
+        if self.is_infinite:
+            ping_center = INFINITE_SYMBOL
+            ping_count_text = f"{format_num(done)}/{INFINITE_SYMBOL}"
+        elif self.total_pings_target > 0:
+            ping_center = f"{done / self.total_pings_target * 100:.0f}%"
+            ping_count_text = f"{format_num(done)}/{format_num(self.total_pings_target)}"
+        else:
+            ping_center, ping_count_text = "0%", "0/0"
+        ping_bar_str = (
+            f"{COLOR_CYAN}Pings:  {COLOR_RESET}"
+            f"{self._build_ping_bar(pb_len, ping_center)}"
+            f" {COLOR_BLUE}{ping_count_text}{COLOR_RESET}"
+        )
+
         if self.total_count > 0:
-            dev_pb_len = PROGRESS_BAR_MAX_LEN
-            dev_pct = (self.completed_count / self.total_count) * 100
-            dev_filled = int(dev_pb_len * dev_pct / 100)
-            dev_pct_text = f"{dev_pct:.0f}%"
-            dev_bar_str = f"{COLOR_CYAN}Devices:{COLOR_RESET}{self._build_bar(dev_pb_len, dev_filled, dev_pct_text)}{COLOR_RESET} {COLOR_BLUE}{format_num(self.completed_count)}/{format_num(self.total_count)}{COLOR_RESET}"
+            dev_center = f"{self.completed_count / self.total_count * 100:.0f}%"
+            dev_count_text = f"{format_num(self.completed_count)}/{format_num(self.total_count)}"
+        else:
+            dev_center, dev_count_text = "0%", "0/0"
+        dev_bar_str = (
+            f"{COLOR_CYAN}Devices:{COLOR_RESET}"
+            f"{self._build_devices_bar(pb_len, dev_center)}{COLOR_RESET}"
+            f" {COLOR_BLUE}{dev_count_text}{COLOR_RESET}"
+        )
 
-        # Network info — aligned in 2 columns, IP/GW top, Subnet/DNS bottom
         ni = self.network_info
-        gw_str = ni.get('gateway', UNKNOWN_VALUE) or UNKNOWN_VALUE
-        ip_str = ni.get('ip', UNKNOWN_VALUE) or UNKNOWN_VALUE
+        ip_str   = ni.get('ip',          UNKNOWN_VALUE) or UNKNOWN_VALUE
         mask_str = ni.get('subnet_mask', UNKNOWN_VALUE) or UNKNOWN_VALUE
-        dns_str = ni.get('dns_servers', [UNKNOWN_VALUE])[0] if ni.get('dns_servers') else UNKNOWN_VALUE
+        gw_str   = ni.get('gateway',     UNKNOWN_VALUE) or UNKNOWN_VALUE
+        dns_str  = ni.get('dns_servers', [UNKNOWN_VALUE])[0] if ni.get('dns_servers') else UNKNOWN_VALUE
 
-        # Column layout: left col = IP/Subnet, right col = GW/DNS
-        # Compact layout: label + 1 space + value, right col aligned
-        net_r1 = (
-            f"{COLOR_CYAN}IP:{COLOR_RESET} {COLOR_BRIGHT_WHITE}{ip_str:<15}{COLOR_RESET}"
-            f"  "
-            f"{COLOR_CYAN}GW:{COLOR_RESET} {COLOR_BRIGHT_WHITE}{gw_str:<15}{COLOR_RESET}"
-        )
-        net_r2 = (
-            f"{COLOR_CYAN}Subnet:{COLOR_RESET} {COLOR_BRIGHT_WHITE}{mask_str:<12}{COLOR_RESET}"
-            f"  "
-            f"{COLOR_CYAN}DNS:{COLOR_RESET} {COLOR_BRIGHT_WHITE}{dns_str:<12}{COLOR_RESET}"
-        )
-
-        # Device stats — aligned in 2 columns, Online/Used top, Offline/Free bottom
-        on = [d for d in self.devices.values() if d.ping_status]
+        on  = [d for d in self.devices.values() if d.ping_status]
         off = [d for d in self.devices.values() if not d.ping_status and (
             (d.mac_address and d.mac_address != UNKNOWN_VALUE) or
-            (d.hostname and d.hostname != UNKNOWN_VALUE)
+            (d.hostname   and d.hostname   != UNKNOWN_VALUE)
         )]
         fr = max(0, self.total_count - len(on) - len(off))
         used = len(on) + len(off)
 
-        # Stats: compact layout, label + space + value
-        stats_r1 = (
-            f"{COLOR_LIGHT_GREEN}Online:{COLOR_RESET} {COLOR_GREEN}{format_num(len(on)):<5}{COLOR_RESET}"
-            f"  "
-            f"{COLOR_LIGHT_GREEN}Offline:{COLOR_RESET} {COLOR_RED}{format_num(len(off)):<5}{COLOR_RESET}"
-        )
-        stats_r2 = (
-            f"{COLOR_LIGHT_GREEN}Used:{COLOR_RESET} {COLOR_BRIGHT_WHITE}{format_num(used):<5}{COLOR_RESET}"
-            f"  "
-            f"{COLOR_LIGHT_GREEN}Free:{COLOR_RESET} {COLOR_BLUE}{format_num(fr):<5}{COLOR_RESET}"
-        )
+        # Two-row info blocks beside the bars. Each block uses kv_block_rows so
+        # labels are left-aligned and values right-aligned with a single space
+        # between the longest label and the value column.
+        def _lab(text, color=COLOR_LIGHT_GREEN):
+            return f"{color}{text}:{COLOR_RESET}"
+        def _val(value, color):
+            return f"{color}{format_num(value)}{COLOR_RESET}"
+        def _nval(value):
+            return f"{COLOR_BRIGHT_WHITE}{value}{COLOR_RESET}"
+        onoff_r0, onoff_r1 = kv_block_rows(_lab('Online'),  _val(len(on), COLOR_GREEN),
+                                           _lab('Offline'), _val(len(off), COLOR_RED))
+        uf_r0, uf_r1       = kv_block_rows(_lab('Used'), _val(used, COLOR_YELLOW),
+                                           _lab('Free'), _val(fr, COLOR_BLUE))
+        ipmask_r0, ipmask_r1 = kv_block_rows(_lab('IP', COLOR_CYAN),   _nval(ip_str),
+                                             _lab('MASK', COLOR_CYAN), _nval(mask_str))
+        gwdns_r0, gwdns_r1   = kv_block_rows(_lab('GW', COLOR_CYAN),  _nval(gw_str),
+                                             _lab('DNS', COLOR_CYAN), _nval(dns_str))
+        stat_r0 = onoff_r0 + "  " + uf_r0
+        stat_r1 = onoff_r1 + "  " + uf_r1
+        net_r0  = ipmask_r0 + "  " + gwdns_r0
+        net_r1  = ipmask_r1 + "  " + gwdns_r1
+        stats_w = get_visible_len(stat_r0)
 
-        # Calculate max bar width for alignment
-        max_bar_len = max(get_visible_len(ping_bar_str), get_visible_len(dev_bar_str)) if (ping_bar_str or dev_bar_str) else 0
+        max_bar_len = max(get_visible_len(ping_bar_str), get_visible_len(dev_bar_str))
+        # Pack the stats + network info immediately to the right of the bars so
+        # they sit close to the bars and the table stays as narrow as possible.
+        stats_start = max_bar_len + HEADER_INFO_GAP
+        net_start = stats_start + stats_w + HEADER_INFO_GAP
 
-        # Output: Pings bar + net_r1 + stats_r1, then Devices bar + net_r2 + stats_r2
-        if ping_bar_str:
-            padding = max(PROGRESS_BAR_MARGIN, max_bar_len + PROGRESS_BAR_MARGIN - get_visible_len(ping_bar_str))
-            output.append(f"{ping_bar_str}{' ' * padding}{net_r1}  {stats_r1}")
-        if dev_bar_str:
-            padding = max(PROGRESS_BAR_MARGIN, max_bar_len + PROGRESS_BAR_MARGIN - get_visible_len(dev_bar_str))
-            output.append(f"{dev_bar_str}{' ' * padding}{net_r2}  {stats_r2}")
+        output.append(_assemble_row([(0, ping_bar_str), (stats_start, stat_r0), (net_start, net_r0)]).rstrip())
+        output.append(_assemble_row([(0, dev_bar_str), (stats_start, stat_r1), (net_start, net_r1)]).rstrip())
 
         output.append(f"{COLOR_BLUE}{'=' * self.table_width}{COLOR_RESET}")
-
-        if not self.devices:
-            if move_home:
-                output.append("\033[J")
-            sys.stdout.write("".join(output))
-            sys.stdout.flush()
-            return
 
         headers = [
             format_cell(colorize_header("IP Address"), COL_IP_WIDTH),
@@ -1375,51 +2349,85 @@ class LiveTable:
             format_cell_center(colorize_header("Ping Avg"), COL_PING_WIDTH),
             format_cell_center(colorize_header("Ping Min"), COL_PING_WIDTH),
             format_cell_center(colorize_header("Ping Max"), COL_PING_WIDTH),
+            format_cell_center(colorize_header("Last Ping"), COL_PING_WIDTH),
             format_cell_center(colorize_header("Progress"), COL_PROGRESS_WIDTH),
             format_cell_center(colorize_header("MAC Address"), COL_MAC_WIDTH)
         ]
         output.append("".join(headers))
         output.append(f"{COLOR_BLUE}{'-' * self.table_width}{COLOR_RESET}")
 
-        sorted_ips = sorted(self.devices.keys(), key=lambda x: tuple(map(int, x.split('.'))))
+        def _ip_sort_key(x: str):
+            parts = x.split('.')
+            return tuple(int(p) for p in parts) if len(parts) == IP_OCTET_COUNT and all(p.isdigit() for p in parts) else (999, 0, 0, 0)
+        sorted_ips = sorted(self.devices.keys(), key=_ip_sort_key)
         for ip in sorted_ips:
             d = self.devices[ip]
-            if not d.ping_status:
-                continue  # Only show devices that actively responded in this scan
-            status = STATUS_ONLINE
-            ac, ar = colorize_ping(d.ping_stats.get('avg'))
-            mc, mr = colorize_ping(d.ping_stats.get('max')) if d.ping_stats.get('max') else (COLOR_WHITE, COLOR_RESET)
-            nc, nr = colorize_ping(d.ping_stats.get('min')) if d.ping_stats.get('min') else (COLOR_WHITE, COLOR_RESET)
+            # Show devices that responded this scan, plus known devices loaded from
+            # the DB (these are listed even while offline).
+            if not d.ping_status and not d.from_db:
+                continue
+            online = d.ping_status
+            status = STATUS_ONLINE if online else STATUS_OFFLINE
+            na = f"{COLOR_DARK_GRAY}N/A{COLOR_RESET}"
+            if online:
+                ac, ar = colorize_ping(d.ping_stats.get('avg'))
+                mc, mr = colorize_ping(d.ping_stats.get('max')) if d.ping_stats.get('max') else (COLOR_WHITE, COLOR_RESET)
+                nc, nr = colorize_ping(d.ping_stats.get('min')) if d.ping_stats.get('min') else (COLOR_WHITE, COLOR_RESET)
+                avg_text = f"{ac}{format_float(d.ping_stats.get('avg'))}{ar}" if d.ping_stats.get('avg') else na
+                max_text = f"{mc}{format_float(d.ping_stats.get('max'))}{mr}" if d.ping_stats.get('max') else na
+                min_text = f"{nc}{format_float(d.ping_stats.get('min'))}{nr}" if d.ping_stats.get('min') else na
+                lc, lr = colorize_ping(d.last_ping) if d.last_ping is not None else (COLOR_WHITE, COLOR_RESET)
+                last_text = f"{lc}{format_float(d.last_ping)}{lr}" if d.last_ping is not None else na
+            else:
+                avg_text = min_text = max_text = last_text = na
 
-            avg_text = f"{ac}{format_float(d.ping_stats.get('avg'))}{ar}" if d.ping_stats.get('avg') else f"{COLOR_DARK_GRAY}N/A{COLOR_RESET}"
-            max_text = f"{mc}{format_float(d.ping_stats.get('max'))}{mr}" if d.ping_stats.get('max') else f"{COLOR_DARK_GRAY}N/A{COLOR_RESET}"
-            min_text = f"{nc}{format_float(d.ping_stats.get('min'))}{nr}" if d.ping_stats.get('min') else f"{COLOR_DARK_GRAY}N/A{COLOR_RESET}"
-
-            host = d.hostname or UNKNOWN_VALUE
             mac = d.mac_address or UNKNOWN_VALUE
-            if len(host) > HOSTNAME_MAX_DISPLAY:
-                host = host[:HOSTNAME_TRUNCATE_LEN] + "..."
+            # Hostname column: real name → magenta; if unknown, fall back to the
+            # MAC manufacturer in yellow; otherwise 'Unknown' in gray.
+            host, host_kind = resolve_hostname_display(d.hostname, mac)
+            host = truncate_host(host, COL_HOSTNAME_WIDTH)
 
-            # Color hostname: red for local IP, magenta for others
             is_local = self.local_ip and d.ip == self.local_ip
-            host_color = colorize_local_hostname(host) if is_local else colorize_hostname(host)
+            if is_local:
+                host_color = colorize_local_hostname(host)
+            elif host_kind == 'vendor':
+                host_color = f"{COLOR_YELLOW}{host}{COLOR_RESET}"
+            else:
+                host_color = colorize_hostname(host)
 
-            # Group visualization — 3 colored blocks if grouped, 3 spaces if not
+            # Group visualization — 3 colored blocks if grouped, 3 spaces if not.
+            # The own host's group uses the same magenta as its IP/hostname.
             group_text = "   "
-            if d.group_id > GROUP_ID_NONE:
+            if is_local:
+                group_text = f"{COLOR_MAGENTA}███{COLOR_RESET}"
+            elif d.group_id > GROUP_ID_NONE:
                 if d.group_id == GROUP_ID_UNKNOWN:
                     color = GROUP_UNKNOWN_COLOR
                 elif d.group_id == GROUP_ID_GATEWAY:
                     color = self.gateway_color
                 else:
-                    c_idx = (d.group_id - GROUP_ID_DYNAMIC_START) % len(GROUP_DYNAMIC_COLORS)
-                    color = GROUP_DYNAMIC_COLORS[c_idx]
+                    c_idx = (d.group_id - GROUP_ID_DYNAMIC_START) % len(GROUP_COLOR_SEQUENCE)
+                    color = GROUP_COLOR_SEQUENCE[c_idx]
                 group_text = f"\033[38;5;{color}m███{COLOR_RESET}"
 
-            progress_text = f"{COLOR_BLUE}{format_num(d.current_pings)}{COLOR_RESET}/{COLOR_BLUE}{format_num(d.target_pings)}{COLOR_RESET}"
+            if online:
+                target_disp = (INFINITE_SYMBOL if d.target_pings == PING_COUNT_INFINITE
+                               else format_num(d.target_pings))
+                progress_text = f"{COLOR_GREEN}{format_num(d.current_pings)}{COLOR_RESET}/{COLOR_GREEN}{target_disp}{COLOR_RESET}"
+            else:
+                progress_text = na
 
-            # Color IP: red for local, cyan for others
-            ip_color = colorize_local_ip(d.ip) if self.local_ip and d.ip == self.local_ip else colorize_ip(d.ip)
+            # Color IP: magenta for local, cyan for online, gray for offline.
+            if self.local_ip and d.ip == self.local_ip:
+                ip_color = colorize_local_ip(d.ip)
+            elif online:
+                ip_color = colorize_ip(d.ip)
+            else:
+                ip_color = f"{COLOR_DARK_GRAY}{d.ip}{COLOR_RESET}"
+            # 'Unknown' MAC is centered; a real MAC stays left-aligned.
+            mac_cell = (format_cell_center(colorize_mac(mac), COL_MAC_WIDTH)
+                        if mac == UNKNOWN_VALUE else
+                        format_cell(colorize_mac(mac), COL_MAC_WIDTH))
             line = (
                 format_cell(ip_color, COL_IP_WIDTH) +
                 format_cell_center(colorize_status(status), COL_STATUS_WIDTH) +
@@ -1429,14 +2437,14 @@ class LiveTable:
                 format_cell_center(avg_text, COL_PING_WIDTH) +
                 format_cell_center(min_text, COL_PING_WIDTH) +
                 format_cell_center(max_text, COL_PING_WIDTH) +
+                format_cell_center(last_text, COL_PING_WIDTH) +
                 format_cell_center(progress_text, COL_PROGRESS_WIDTH) +
-                format_cell(colorize_mac(mac), COL_MAC_WIDTH)
+                mac_cell
             )
             output.append(line)
 
         # Whole Network summary row
-        online_devs = [d for d in self.devices.values() if d.ping_status]
-        all_avgs = [d.ping_stats.get('avg') for d in self.devices.values() if d.ping_stats.get('avg')]
+        all_avgs = [d.ping_stats.get('avg') for d in self.devices.values() if d.ping_stats.get('avg') is not None]
         all_mins = [d.ping_stats.get('min') for d in self.devices.values() if d.ping_stats.get('min') is not None]
         all_maxs = [d.ping_stats.get('max') for d in self.devices.values() if d.ping_stats.get('max') is not None]
         if all_avgs:
@@ -1448,37 +2456,70 @@ class LiveTable:
             min_text = f"{colorize_ping(net_min)[0]}{format_float(net_min)}{colorize_ping(net_min)[1]}" if net_min else f"{COLOR_DARK_GRAY}N/A{COLOR_RESET}"
             max_text = f"{colorize_ping(net_max)[0]}{format_float(net_max)}{colorize_ping(net_max)[1]}" if net_max else f"{COLOR_DARK_GRAY}N/A{COLOR_RESET}"
             wn_label = f"{COLOR_BOLD}{COLOR_LIGHT_GREEN}Whole Network{COLOR_RESET}"
+            # Overall internet ping average, shown to the right of "Whole Network".
+            inet_avg = self._internet_avg()
+            if inet_avg is not None:
+                iac, iar = colorize_ping(inet_avg)
+                inet_label = f"{COLOR_BRIGHT_WHITE}Internet Avg:{COLOR_RESET} {iac}{format_float(inet_avg)}{iar}"
+            else:
+                inet_label = ""
+            mid_width = COL_STATUS_WIDTH + COL_GROUP_WIDTH + 1 + COL_HOSTNAME_WIDTH
             output.append(f"{COLOR_BLUE}{'-' * self.table_width}{COLOR_RESET}")
             output.append(
                 format_cell(wn_label, COL_IP_WIDTH) +
-                format_cell_center("", COL_STATUS_WIDTH) +
-                format_cell_center("", COL_GROUP_WIDTH) +
-                " " +
-                format_cell("", COL_HOSTNAME_WIDTH) +
+                format_cell(inet_label, mid_width) +
                 format_cell_center(avg_text, COL_PING_WIDTH) +
                 format_cell_center(min_text, COL_PING_WIDTH) +
                 format_cell_center(max_text, COL_PING_WIDTH) +
+                format_cell_center("", COL_PING_WIDTH) +
                 format_cell_center("", COL_PROGRESS_WIDTH) +
                 format_cell("", COL_MAC_WIDTH)
             )
 
+        # Separator between the Whole Network row and the internet pings.
+        output.append(f"{COLOR_BLUE}{'-' * self.table_width}{COLOR_RESET}")
         output.extend(self._get_statistics_lines(list(self.devices.values()), colors=True))
         output.append(f"{COLOR_BLUE}{'=' * self.table_width}{COLOR_RESET}")
 
-        if move_home:
-            output.append("\033[J")
-            sys.stdout.write("\n".join(output))
-        else:
-            sys.stdout.write("\n" + "\n".join(output) + "\n")
+        # Controls hint footer — only while actively scanning. Turns yellow and
+        # shows the resume wording while paused.
+        if self.phase_number in (PHASE_DISCOVERY, PHASE_ANALYSIS):
+            if self.paused:
+                hint = f"{COLOR_YELLOW}{CONTROLS_HINT_PAUSED}{COLOR_RESET}"
+            else:
+                hint = f"{COLOR_DARK_GRAY}{CONTROLS_HINT_RUNNING}{COLOR_RESET}"
+            pad = max(0, (self.table_width - get_visible_len(hint)) // 2)
+            output.append(" " * pad + hint)
+
+        self._write_frame(output, clear_first)
+
+    def _write_frame(self, output: List[str], clear_first: bool = False) -> None:
+        """Redraw the whole frame in place, smoothly and without leaving scrollback.
+
+        - \\033[H homes the cursor; each line ends with \\033[K (erase to EOL) and
+          the frame ends with \\033[J (erase to end of screen). This overwrites
+          the previous frame in place instead of a full \\033[2J clear (which
+          flashes and pushes old content into the scrollback on Windows). With no
+          trailing newline the cursor never advances past the last line, so a
+          fitting frame creates no scrollback — the user can't scroll up.
+        - The first frame additionally does \\033[3J\\033[2J to wipe whatever was
+          on screen (and its scrollback) before the scan started.
+
+        (No synchronized-output \\033[?2026 markers: some Windows consoles hold the
+        frame until a resize forces a repaint, which left the window blank.)
+        """
+        body = "\033[K\n".join(output) + "\033[K"
+        prefix = "\033[3J\033[2J\033[H" if clear_first else "\033[H"
+        sys.stdout.write(prefix + body + "\033[J")
         sys.stdout.flush()
 
-    def _render(self, force: bool = False, move_home: bool = True):
+    def _render(self, force: bool = False, clear_first: bool = False):
         if not force:
             now = time.time()
             if now - self.last_render_time < self.render_throttle:
                 return
         self.last_render_time = time.time()
-        self._render_internal(move_home=move_home)
+        self._render_internal(clear_first=clear_first)
 
     def get_final_results_text(self) -> str:
         """Generate plain text output matching the terminal format."""
@@ -1495,18 +2536,25 @@ class LiveTable:
 
             # Title with phase
             phase = f"{self.phase_number} - {self.current_phase}"
-            if self.pings_per_device > 0:
+            if self.pings_per_device == PING_COUNT_INFINITE:
+                phase += f" ({INFINITE_SYMBOL} pings)"
+            elif self.pings_per_device > 0:
                 phase += f" ({format_num(self.pings_per_device)} pings)"
             title = "Network Scanner"
             phase_indent = 8
-            title_pad = (self.table_width - len(title)) // 2
             phase_prefix = " " * phase_indent + phase
             phase_vis_len = len(phase_prefix)
-            min_title_start = phase_vis_len + 2
-            title_start = max(title_pad, min_title_start)
-            left_spaces = max(0, title_start - phase_vis_len)
-            header_line = phase_prefix + " " * left_spaces + title
-            lines.append(fmt(header_line))
+            subnets_text = f"Subnets: {', '.join(self.scanned_subnets)}" if self.scanned_subnets else ""
+            subnets_vis = len(subnets_text)
+            right_limit = self.table_width - subnets_vis - (2 if subnets_vis else 0)
+            title_start = max(phase_vis_len + 2, (self.table_width - len(title)) // 2)
+            if title_start + len(title) > right_limit:
+                title_start = max(phase_vis_len + 2, right_limit - len(title))
+            header_line = phase_prefix + " " * max(0, title_start - phase_vis_len) + title
+            if subnets_text:
+                cur = title_start + len(title)
+                header_line += " " * max(2, self.table_width - subnets_vis - cur) + subnets_text
+            lines.append(header_line)
 
             # Progress bars (always at 100%)
             ping_bar_str = ""
@@ -1525,117 +2573,173 @@ class LiveTable:
                 dev_pct_text = f"{dev_pct:.0f}%"
                 dev_bar_str = f"Devices:{self._build_bar(dev_pb_len, dev_filled, dev_pct_text)} {format_num(self.completed_count)}/{format_num(self.total_count)}"
 
-            # Network info in 2 columns
+            # Two-row info block (mirrors the live view): stats centred, network
+            # info right-aligned. Plain text — no colours.
             ni = self.network_info
-            gw_str = ni.get('gateway', UNKNOWN_VALUE) or UNKNOWN_VALUE
-            ip_str = ni.get('ip', UNKNOWN_VALUE) or UNKNOWN_VALUE
+            ip_str   = ni.get('ip',          UNKNOWN_VALUE) or UNKNOWN_VALUE
             mask_str = ni.get('subnet_mask', UNKNOWN_VALUE) or UNKNOWN_VALUE
-            dns_str = ni.get('dns_servers', [UNKNOWN_VALUE])[0] if ni.get('dns_servers') else UNKNOWN_VALUE
-            net_label_w = 4
-            net_val_w = 15
-            net_r1 = f"IP:{' ' * (net_label_w - 3 + 3)}{ip_str:<{net_val_w}}GW:{' ' * (net_label_w - 3 + 3)}{gw_str:<{net_val_w}}"
-            net_r2 = f"Subnet:{' ' * (net_label_w - 6 + 3)}{mask_str:<{net_val_w}}DNS:{' ' * (net_label_w - 4 + 3)}{dns_str:<{net_val_w}}"
-
-            # Device stats in 2 columns
-            on = [d for d in devs if d.ping_status]
+            gw_str   = ni.get('gateway',     UNKNOWN_VALUE) or UNKNOWN_VALUE
+            dns_str  = ni.get('dns_servers', [UNKNOWN_VALUE])[0] if ni.get('dns_servers') else UNKNOWN_VALUE
+            on  = [d for d in devs if d.ping_status]
             off = [d for d in devs if not d.ping_status and (
                 (d.mac_address and d.mac_address != UNKNOWN_VALUE) or
-                (d.hostname and d.hostname != UNKNOWN_VALUE)
+                (d.hostname    and d.hostname    != UNKNOWN_VALUE)
             )]
             fr = max(0, self.total_count - len(on) - len(off))
             used = len(on) + len(off)
-            stat_label_w = 4
-            stat_val_w = 4
-            stats_r1 = f"Online:{' ' * (stat_label_w - 7 + 3)}{format_num(len(on)):<{stat_val_w}}Offline:{' ' * (stat_label_w - 8 + 3)}{format_num(len(off)):<{stat_val_w}}"
-            stats_r2 = f"Used:{' ' * (stat_label_w - 5 + 3)}{format_num(used):<{stat_val_w}}Free:{' ' * (stat_label_w - 5 + 3)}{format_num(fr):<{stat_val_w}}"
+            # Same label-left / value-right blocks as the live view (plain text).
+            onoff_r0, onoff_r1 = kv_block_rows("Online:", format_num(len(on)),
+                                               "Offline:", format_num(len(off)))
+            uf_r0, uf_r1       = kv_block_rows("Used:", format_num(used),
+                                               "Free:", format_num(fr))
+            ipmask_r0, ipmask_r1 = kv_block_rows("IP:", ip_str, "MASK:", mask_str)
+            gwdns_r0, gwdns_r1   = kv_block_rows("GW:", gw_str, "DNS:", dns_str)
+            stat_r0 = onoff_r0 + "  " + uf_r0
+            stat_r1 = onoff_r1 + "  " + uf_r1
+            net_r0  = ipmask_r0 + "  " + gwdns_r0
+            net_r1  = ipmask_r1 + "  " + gwdns_r1
+            stats_w = get_visible_len(stat_r0)
+
+            # Threads row above the bars, right-aligned to the bar's end.
+            bar_end_col = len("Pings:  ") + PROGRESS_BAR_MAX_LEN
+            thr_text = f"Threads: {format_num(self.active_threads)}"
+            lines.append(" " * max(0, bar_end_col - len(thr_text)) + thr_text)
 
             max_bar_len = max(get_visible_len(ping_bar_str), get_visible_len(dev_bar_str)) if (ping_bar_str or dev_bar_str) else 0
-
-            if ping_bar_str:
-                padding = max(PROGRESS_BAR_MARGIN, max_bar_len + PROGRESS_BAR_MARGIN - get_visible_len(ping_bar_str))
-                lines.append(ping_bar_str + " " * padding + net_r1 + "  " + stats_r1)
-            if dev_bar_str:
-                padding = max(PROGRESS_BAR_MARGIN, max_bar_len + PROGRESS_BAR_MARGIN - get_visible_len(dev_bar_str))
-                lines.append(dev_bar_str + " " * padding + net_r2 + "  " + stats_r2)
+            stats_start = max_bar_len + HEADER_INFO_GAP
+            net_start = stats_start + stats_w + HEADER_INFO_GAP
+            lines.append(_assemble_row([(0, ping_bar_str), (stats_start, stat_r0), (net_start, net_r0)]).rstrip())
+            lines.append(_assemble_row([(0, dev_bar_str), (stats_start, stat_r1), (net_start, net_r1)]).rstrip())
 
             lines.append("=" * self.table_width)
 
-            # Table header (Group centered in COL_GROUP_WIDTH + 1 space gap)
-            grp_header = "Group"
-            g_pad = max(0, COL_GROUP_WIDTH - len(grp_header))
-            g_left = g_pad // 2
-            g_right = g_pad - g_left
+            # Table header — the Group column is omitted in the plain-text file
+            # output (the block glyphs misaligned in text viewers); the remaining
+            # columns are shifted up to fill the gap.
             lines.append(
-                f"{'IP Address':<18} {'Status':<12} {' ' * g_left}{grp_header}{' ' * g_right}  {'Hostname':<30} "
-                f"{'Ping Avg':<13} {'Ping Min':<13} {'Ping Max':<13} "
-                f"{'Progress':<12} {'MAC Address':<20}"
+                f"{'IP Address':<{COL_IP_WIDTH-1}} {'Status':<{COL_STATUS_WIDTH-1}} "
+                f"{'Hostname':<{COL_HOSTNAME_WIDTH-1}} "
+                f"{'Ping Avg':<{COL_PING_WIDTH-1}} {'Ping Min':<{COL_PING_WIDTH-1}} {'Ping Max':<{COL_PING_WIDTH-1}} {'Last Ping':<{COL_PING_WIDTH-1}} "
+                f"{'Progress':<{COL_PROGRESS_WIDTH-1}} {'MAC Address':<{COL_MAC_WIDTH}}"
             )
             lines.append("-" * self.table_width)
 
-            # Device rows — only confirmed online devices
-            sorted_ips = sorted(self.devices.keys(), key=lambda x: tuple(map(int, x.split('.'))))
+            # Device rows — online devices plus known (DB) devices, even offline.
+            def _ip_sort_key(x: str):
+                parts = x.split('.')
+                return (tuple(int(p) for p in parts)
+                        if len(parts) == IP_OCTET_COUNT and all(p.isdigit() for p in parts)
+                        else (999, 0, 0, 0))
+            sorted_ips = sorted(self.devices.keys(), key=_ip_sort_key)
             for ip in sorted_ips:
                 d = self.devices[ip]
-                if not d.ping_status:
+                if not d.ping_status and not d.from_db:
                     continue
-                status = STATUS_ONLINE
-                host = d.hostname or UNKNOWN_VALUE
+                online = d.ping_status
+                status = STATUS_ONLINE if online else STATUS_OFFLINE
                 mac = d.mac_address or UNKNOWN_VALUE
-                if len(host) > HOSTNAME_MAX_DISPLAY:
-                    host = host[:HOSTNAME_TRUNCATE_LEN] + "..."
+                host, _ = resolve_hostname_display(d.hostname, mac)
+                # File field is COL_HOSTNAME_WIDTH-1 wide; truncate to fit exactly
+                # so a long name can never shift the following columns.
+                host = truncate_host(host, COL_HOSTNAME_WIDTH - 1)
 
-                # Group: 3 colored blocks or 3 dashes
-                if d.group_id > GROUP_ID_NONE:
-                    group = "███"
+                if online:
+                    target_disp = (INFINITE_SYMBOL if d.target_pings == PING_COUNT_INFINITE
+                                   else format_num(d.target_pings))
+                    progress = f"{format_num(d.current_pings)}/{target_disp}"
+                    avg = format_float(d.ping_stats.get('avg')) if d.ping_stats.get('avg') else "N/A"
+                    mn  = format_float(d.ping_stats.get('min')) if d.ping_stats.get('min') else "N/A"
+                    mx  = format_float(d.ping_stats.get('max')) if d.ping_stats.get('max') else "N/A"
+                    lp  = format_float(d.last_ping) if d.last_ping is not None else "N/A"
                 else:
-                    group = "   "
+                    progress, avg, mn, mx, lp = "-", "N/A", "N/A", "N/A", "N/A"
 
-                progress = f"{format_num(d.current_pings)}/{format_num(d.target_pings)}"
-                avg = format_float(d.ping_stats.get('avg')) if d.ping_stats.get('avg') else "N/A"
-                mn = format_float(d.ping_stats.get('min')) if d.ping_stats.get('min') else "N/A"
-                mx = format_float(d.ping_stats.get('max')) if d.ping_stats.get('max') else "N/A"
-
-                # Center group in COL_GROUP_WIDTH
-                g_pad = max(0, COL_GROUP_WIDTH - len(group))
-                g_left = g_pad // 2
-                g_right = g_pad - g_left
+                # 'Unknown' MAC is centered; a real MAC stays left-aligned.
+                mac_cell = mac.center(COL_MAC_WIDTH) if mac == UNKNOWN_VALUE else f"{mac:<{COL_MAC_WIDTH}}"
                 lines.append(
-                    f"{d.ip:<18} {status:<12} {' ' * g_left}{group}{' ' * g_right}  {host:<30} "
-                    f"{avg:<13} {mn:<13} {mx:<13} {progress:<12} {mac:<20}"
+                    f"{d.ip:<{COL_IP_WIDTH-1}} {status:<{COL_STATUS_WIDTH-1}} "
+                    f"{host:<{COL_HOSTNAME_WIDTH-1}} "
+                    f"{avg:<{COL_PING_WIDTH-1}} {mn:<{COL_PING_WIDTH-1}} {mx:<{COL_PING_WIDTH-1}} {lp:<{COL_PING_WIDTH-1}} "
+                    f"{progress:<{COL_PROGRESS_WIDTH-1}} {mac_cell}"
                 )
 
             # Whole Network summary row
-            all_avgs = [d.ping_stats.get('avg') for d in devs if d.ping_stats.get('avg')]
+            all_avgs = [d.ping_stats.get('avg') for d in devs if d.ping_stats.get('avg') is not None]
             all_mins = [d.ping_stats.get('min') for d in devs if d.ping_stats.get('min') is not None]
             all_maxs = [d.ping_stats.get('max') for d in devs if d.ping_stats.get('max') is not None]
             if all_avgs:
                 net_avg = sum(all_avgs) / len(all_avgs)
                 net_min = min(all_mins) if all_mins else None
                 net_max = max(all_maxs) if all_maxs else None
+                inet_avg = self._internet_avg()
+                inet_text = (f"Internet Avg: {format_float(inet_avg)}"
+                             if inet_avg is not None else "")
+                mid_width = (COL_STATUS_WIDTH - 1) + 1 + (COL_HOSTNAME_WIDTH - 1)
                 lines.append("-" * self.table_width)
                 lines.append(
-                    f"{'Whole Network':<18} {'':12} {'':3}  {'':30} "
-                    f"{format_float(net_avg):<13} "
-                    f"{format_float(net_min) if net_min else 'N/A':<13} "
-                    f"{format_float(net_max) if net_max else 'N/A':<13} {'':12} {'':20}"
+                    f"{'Whole Network':<{COL_IP_WIDTH-1}} "
+                    f"{inet_text:<{mid_width}} "
+                    f"{format_float(net_avg):<{COL_PING_WIDTH-1}} "
+                    f"{format_float(net_min) if net_min else 'N/A':<{COL_PING_WIDTH-1}} "
+                    f"{format_float(net_max) if net_max else 'N/A':<{COL_PING_WIDTH-1}} "
+                    f"{'':<{COL_PING_WIDTH-1}} "
+                    f"{'':<{COL_PROGRESS_WIDTH-1}} {'':<{COL_MAC_WIDTH}}"
                 )
 
+            # Separator between the Whole Network row and the internet pings.
+            lines.append("-" * self.table_width)
             # Internet stats (2 lines, centered)
             stat_lines = self._get_statistics_lines(devs, colors=False)
             ansi_re = re.compile(r'\033\[[0-9;]*m')
             lines.extend(ansi_re.sub('', line) for line in stat_lines)
 
             lines.append("=" * self.table_width)
-            return '\n'.join(lines)
+            # The saved report must be pure plain text — strip every escape code
+            # (the progress-bar rows still carry colour codes at this point).
+            return ansi_re.sub('', '\n'.join(lines))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # INPUT LISTENER
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def input_listener(control: ScannerControl):
+def _hard_exit_now(lt: "Optional[LiveTable]" = None) -> None:
+    """ESC handler: stop the render thread, reset the terminal and kill the
+    process at once (daemon worker threads die with it)."""
+    try:
+        if lt is not None:
+            lt.stop_refresh_timer()
+    except Exception:
+        pass
+    try:
+        sys.stdout.write(COLOR_RESET + "\033[?25h\n")  # reset colours, show cursor
+        sys.stdout.flush()
+    except Exception:
+        pass
+    os._exit(0)
+
+
+def _handle_scan_key(ch: str, control: ScannerControl, lt: "Optional[LiveTable]") -> bool:
+    """Apply one keypress during a scan. Returns True when the listener should
+    stop. ESC aborts immediately; P pauses/resumes; Q stops and keeps results."""
+    if ch in ('\x1b', '\x03'):          # ESC / Ctrl-C → abort now, no end screen
+        control.request_hard_exit()
+        _hard_exit_now(lt)              # does not return
+        return True
+    if ch == 'p':                       # pause / resume
+        control.toggle_pause()
+        if lt is not None:
+            lt.set_paused(control.paused)
+        return False
+    if ch == 'q':                       # graceful stop → show end screen
+        control.request_stop()
+        return True
+    return False
+
+
+def input_listener(control: ScannerControl, lt: "Optional[LiveTable]" = None):
     if platform.system() == "Windows":
-        _input_listener_windows(control)
+        _input_listener_windows(control, lt)
         return
     if not sys.stdin.isatty() or termios is None or tty is None:
         return
@@ -1648,18 +2752,10 @@ def input_listener(control: ScannerControl):
             rl, _, _ = select.select([fd], [], [], INPUT_POLL_TIMEOUT)
             if rl:
                 inp = os.read(fd, INPUT_READ_SIZE).decode('utf-8', errors='ignore').lower()
-                if '\x1b' in inp:
-                    control.request_stop()
+                ch = '\x1b' if '\x1b' in inp else (inp[:1] if inp else '')
+                if ch and _handle_scan_key(ch, control, lt):
                     break
-                elif 'p' in inp:
-                    control.toggle_pause()
-                elif 'r' in inp:
-                    control.request_restart()
-                    break
-                elif 'q' in inp:
-                    control.request_stop()
-                    break
-            if control.stop_requested or control.restart_requested:
+            if control.should_exit_task():
                 break
     except Exception:
         pass
@@ -1667,7 +2763,7 @@ def input_listener(control: ScannerControl):
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
-def _input_listener_windows(control: ScannerControl):
+def _input_listener_windows(control: ScannerControl, lt: "Optional[LiveTable]" = None):
     """Non-blocking keyboard listener for Windows using msvcrt."""
     if _msvcrt is None:
         return
@@ -1678,18 +2774,9 @@ def _input_listener_windows(control: ScannerControl):
                 _msvcrt.getch()  # consume extended key (arrows, F-keys, …)
                 continue
             ch = raw.decode('utf-8', errors='ignore').lower()
-            if ch in ('\x1b', '\x03'):
-                control.request_stop()
+            if _handle_scan_key(ch, control, lt):
                 break
-            elif ch == 'p':
-                control.toggle_pause()
-            elif ch == 'r':
-                control.request_restart()
-                break
-            elif ch == 'q':
-                control.request_stop()
-                break
-        if control.stop_requested or control.restart_requested:
+        if control.should_exit_task():
             break
         time.sleep(KEY_SLEEP_INTERVAL)
 
@@ -1698,51 +2785,115 @@ def _input_listener_windows(control: ScannerControl):
 # PING FUNCTIONS
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def ping_succeeded(returncode: int, stdout: str) -> bool:
+    """True only for a genuine echo reply from the target host.
+
+    Windows `ping` returns exit code 0 even when a router answers with
+    'Destination host unreachable' (DE: 'Zielhost nicht erreichbar') — that is
+    NOT the host being online. A real reply always reports a TTL, while
+    unreachable/timeout replies do not. We therefore require a TTL and reject
+    the known unreachable/timeout phrases (English + German)."""
+    if returncode != 0:
+        return False
+    low = stdout.lower()
+    if 'ttl=' not in low:
+        return False
+    bad = ('unreachable', 'nicht erreichbar', 'timed out',
+           'zeitüberschreitung', 'expired in transit', 'abgelaufen',
+           'general failure', 'allgemeiner fehler')
+    return not any(b in low for b in bad)
+
+
 def ping_host_multiple(
     ip: str,
     count: int = DEFAULT_PING_COUNT,
     lt: Optional[LiveTable] = None,
     ctrl: Optional[ScannerControl] = None,
     local_ip: str = None,
-    local_mac: str = None
+    local_mac: str = None,
+    interval_ms: int = PING_INTERVAL_MS
 ) -> Device:
-    """Ping a host multiple times and return a Device with collected stats."""
+    """Ping a host multiple times and return a Device with collected stats.
+    count == PING_COUNT_INFINITE pings forever until the scan is stopped."""
     system = platform.system()
     mac = get_mac_address(ip, system, local_ip, local_mac)
-    host = get_hostname(ip)
+    # Docker Desktop injects "host.docker.internal" → use the real machine name
+    host = platform.node() if (local_ip and ip == local_ip) else get_hostname(ip)
 
     lats: List[float] = []
-    succ = 0
     dev = Device(ip=ip, mac_address=mac, hostname=host, target_pings=count, current_pings=0)
 
     if lt:
         lt.update_device(dev)
+        with lt.lock:
+            lt.active_threads += 1
 
-    for i in range(count):
+    try:
+        _ping_loop(ip, count, lt, ctrl, local_ip, local_mac, dev, lats, system, interval_ms)
+    finally:
+        if lt:
+            with lt.lock:
+                lt.active_threads = max(0, lt.active_threads - 1)
+    return dev
+
+
+def _ping_loop(ip, count, lt, ctrl, local_ip, local_mac, dev, lats, system,
+               interval_ms=PING_INTERVAL_MS):
+    """Inner ping loop for ping_host_multiple (kept separate so the active-thread
+    counter can be decremented reliably in a finally block). Paces consecutive
+    pings to the same host by interval_ms, and supports an unlimited (∞) count."""
+    succ = 0
+    consecutive_failures = 0
+    infinite = count == PING_COUNT_INFINITE
+    interval_s = max(0, interval_ms) / 1000.0
+    i = 0
+    while infinite or i < count:
         if ctrl and ctrl.should_exit_task():
+            # Record remaining as skipped (scan was aborted)
+            if lt and not infinite and count - i > 0:
+                lt.record_skipped(count - i)
             break
         if ctrl:
             ctrl.wait_if_paused()
-
-        timeout_arg = WINDOWS_PING_TIMEOUT_MS if system == "Windows" else UNIX_PING_TIMEOUT_S
-        cmd = [
-            "ping",
-            "-n" if system == "Windows" else "-c", "1",
-            "-w" if system == "Windows" else "-W", str(timeout_arg),
-            ip
-        ]
+            if ctrl.should_exit_task():
+                if lt and not infinite and count - i > 0:
+                    lt.record_skipped(count - i)
+                break
 
         try:
-            res = _run(cmd, timeout=PING_TIMEOUT_SECONDS)
+            success, latency = measure_ping(ip, system)
             dev.current_pings = i + 1
 
-            if res.returncode == 0:
+            if success:
+                consecutive_failures = 0
                 succ += 1
                 dev.ping_status = True
-                m = re.search(r'time[=<:]\s*([\d.]+)\s*ms', res.stdout, re.IGNORECASE)
-                if m:
-                    latency = float(m.group(1))
+                if lt:
+                    lt.record_ping(True)
+                if succ == 1:
+                    # ARP cache is populated after the first reply — refresh MAC.
+                    if dev.mac_address is None or dev.mac_address == UNKNOWN_VALUE:
+                        refreshed = get_mac_address(ip, system, local_ip, local_mac)
+                        if refreshed:
+                            dev.mac_address = refreshed
+                    # Resolve hostname via reverse DNS once the host is confirmed up.
+                    if dev.hostname is None or dev.hostname == UNKNOWN_VALUE:
+                        h = get_hostname(ip)
+                        if h:
+                            dev.hostname = h
+                    # Cross-subnet fallback: a direct NetBIOS query reaches hosts
+                    # that reverse DNS / ARP cannot (different subnet, no PTR).
+                    need_host = dev.hostname is None or dev.hostname == UNKNOWN_VALUE
+                    need_mac = dev.mac_address is None or dev.mac_address == UNKNOWN_VALUE
+                    if system == "Windows" and (need_host or need_mac):
+                        nb_name, nb_mac = _netbios_lookup(ip)
+                        if need_host and nb_name:
+                            dev.hostname = nb_name
+                        if need_mac and nb_mac:
+                            dev.mac_address = nb_mac
+                if latency is not None:
                     lats.append(latency)
+                    dev.last_ping = latency   # most recently measured value
                     dev.latency_ms = sum(lats) / len(lats)
                     dev.ping_stats = {
                         'min': min(lats),
@@ -1750,6 +2901,21 @@ def ping_host_multiple(
                         'avg': sum(lats) / len(lats),
                         'count': succ
                     }
+            else:
+                consecutive_failures += 1
+                if lt:
+                    lt.record_ping(False)
+                # 5 consecutive failures during a finite analysis → device is
+                # offline, skip the rest. (∞ mode keeps probing — it's a monitor.)
+                if (not infinite and count > DISCOVERY_PING_COUNT
+                        and consecutive_failures >= ANALYSIS_MAX_CONSECUTIVE_FAILURES):
+                    remaining = count - (i + 1)
+                    if remaining > 0:
+                        dev.current_pings = count   # show as fully processed
+                        if lt:
+                            lt.record_skipped(remaining)
+                            lt.update_device(dev)
+                    break
 
             if lt:
                 lt.update_device(dev)
@@ -1757,36 +2923,41 @@ def ping_host_multiple(
             dev.current_pings = i + 1
             if lt:
                 lt.update_device(dev)
+            i += 1
             continue
+
+        i += 1
+        # Pace consecutive pings to the same host (no wait after the last ping).
+        if interval_s and (infinite or i < count):
+            time.sleep(interval_s)
 
     return dev
 
 
-def ping_internet_hosts(live_table: LiveTable, hosts: List[str], count: int = DEFAULT_PING_COUNT):
-    """Ping internet hosts in parallel and update latency. Each host gets its own thread."""
+def ping_internet_hosts(live_table: LiveTable, hosts: List[str],
+                        count: int = DEFAULT_PING_COUNT,
+                        interval_ms: int = PING_INTERVAL_MS):
+    """Ping internet hosts in parallel and update latency. Each host gets its own
+    thread. ∞ scans fall back to a fixed sample so this still terminates."""
+    if count == PING_COUNT_INFINITE:
+        count = INITIAL_INTERNET_PING_COUNT
+    interval_s = max(0, interval_ms) / 1000.0
+
     def _ping_one(host: str):
         system = platform.system()
         lats: List[float] = []
         succ = 0
 
-        for _ in range(count):
-            timeout_arg = WINDOWS_PING_TIMEOUT_MS if system == "Windows" else UNIX_PING_TIMEOUT_S
-            cmd = [
-                "ping",
-                "-n" if system == "Windows" else "-c", "1",
-                "-w" if system == "Windows" else "-W", str(timeout_arg),
-                host
-            ]
-
+        for n in range(count):
             try:
-                res = _run(cmd, timeout=PING_TIMEOUT_SECONDS)
-                if res.returncode == 0:
-                    m = re.search(r'time[=<:]\s*([\d.]+)\s*ms', res.stdout, re.IGNORECASE)
-                    if m:
-                        lats.append(float(m.group(1)))
-                        succ += 1
+                success, latency = measure_ping(host, system)
+                if success and latency is not None:
+                    lats.append(latency)
+                    succ += 1
             except Exception:
                 pass
+            if interval_s and n + 1 < count:
+                time.sleep(interval_s)
 
         if lats:
             live_table.set_public_latency(host, {
@@ -1803,9 +2974,48 @@ def ping_internet_hosts(live_table: LiveTable, hosts: List[str], count: int = DE
         t.join()
 
 
+def prefill_internet_latency(live_table: LiveTable, hosts: List[str]) -> None:
+    """Quick parallel pre-fill of internet latencies so the header shows values
+    early. Runs in the background so it never blocks the layout or the scan."""
+    ping_internet_hosts(live_table, hosts, INITIAL_INTERNET_PING_COUNT)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # SUBNET SCAN
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def _merge_known_devices(live_table: "LiveTable", db_path: str, gateway_mac: str) -> None:
+    """Persist this scan's devices to the DB and merge the network's known
+    devices back in: enrich online entries with stored MAC/hostname and add
+    offline known devices so they appear in the table too."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with live_table.lock:
+        current = list(live_table.devices.values())
+    save_known_devices(db_path, gateway_mac, current, timestamp)
+
+    known = load_known_devices(db_path, gateway_mac)
+    with live_table.lock:
+        present_macs = {(d.mac_address or "").upper()
+                        for d in live_table.devices.values()
+                        if d.mac_address and d.mac_address != UNKNOWN_VALUE}
+        for kd in known:
+            if kd.ip in live_table.devices:
+                curr = live_table.devices[kd.ip]
+                if (not curr.mac_address or curr.mac_address == UNKNOWN_VALUE) and kd.mac_address != UNKNOWN_VALUE:
+                    curr.mac_address = kd.mac_address
+                if (not curr.hostname or curr.hostname == UNKNOWN_VALUE) and kd.hostname != UNKNOWN_VALUE:
+                    curr.hostname = kd.hostname
+                # A known device that was probed but didn't answer this scan is
+                # still listed (as a known offline device).
+                if not curr.ping_status:
+                    curr.from_db = True
+                continue
+            # A known device that wasn't probed at all (e.g. its IP is outside the
+            # scanned range) and isn't already listed under another IP → add it.
+            if (kd.mac_address or "").upper() in present_macs:
+                continue
+            live_table.devices[kd.ip] = kd
+
 
 def scan_subnet(
     subnet: str,
@@ -1819,134 +3029,142 @@ def scan_subnet(
     high_pressure: bool = False,
     internet_hosts: Optional[List[str]] = None,
     output_dir: str = ".",
-    file_output: bool = True
+    file_output: bool = True,
+    interval_ms: int = PING_INTERVAL_MS,
+    use_db: bool = True,
+    db_path: str = KNOWN_DEVICES_DB_FILE
 ) -> LiveTable:
-    """Scan a subnet and ping all devices."""
+    """Scan one or more subnets and ping all devices.
+    `subnet` may be a single '/24' prefix string (e.g. '192.168.1') or a list
+    of such prefixes; every host 1..255 in each subnet is scanned.
+    ping_count == PING_COUNT_INFINITE keeps pinging until the scan is stopped."""
     live_table = live_table_obj if live_table_obj else LiveTable()
-    ip_range = [f"{subnet}.{i}" for i in range(SUBNET_FIRST_IP, SUBNET_LAST_IP + 1)]
+    subnets = [subnet] if isinstance(subnet, str) else list(subnet)
+    ip_range = [f"{sn}.{i}" for sn in subnets
+                for i in range(SUBNET_FIRST_IP, SUBNET_LAST_IP + 1)]
     live_table.total_count = len(ip_range)
+
+    infinite = ping_count == PING_COUNT_INFINITE
+    live_table.set_infinite(infinite)
 
     live_table.start_refresh_timer()
     last_group_calc = time.time()
 
-    # Calculate total pings for progress bar
+    def _maybe_recalc_groups():
+        nonlocal last_group_calc
+        if time.time() - last_group_calc > GROUP_CALC_INTERVAL_SECONDS:
+            live_table.calculate_groups()
+            last_group_calc = time.time()
+
+    # Progress-bar totals. ∞ mode has no finite ping target, so the pings bar is
+    # left indeterminate (it renders the ∞ symbol instead of a percentage).
+    # High-pressure mode pings ping_count times per device with no separate
+    # discovery pass, so it has no discovery pings to count.
     _internet_hosts = internet_hosts if internet_hosts else []
-    discovery_pings = len(ip_range) * DISCOVERY_PING_COUNT
-    analysis_pings = len(ip_range) * ping_count if ping_count > 0 else 0
-    internet_pings = len(_internet_hosts) * ping_count
-    live_table.set_total_pings(0, discovery_pings + analysis_pings + internet_pings)
+    analysis_per_ip = 0 if (ping_count <= 0 or infinite) else ping_count
+    internet_count = INITIAL_INTERNET_PING_COUNT if infinite else ping_count
+    discovery_pings = 0 if high_pressure else len(ip_range) * DISCOVERY_PING_COUNT
+    analysis_pings = len(ip_range) * analysis_per_ip
+    internet_pings = len(_internet_hosts) * max(0, internet_count)
+    if infinite:
+        live_table.set_total_pings(0)
+    else:
+        live_table.set_total_pings(discovery_pings + analysis_pings + internet_pings)
+    # The ping totals can be wider than the device count — refit the width now.
+    live_table.fit_width()
 
     live_table.set_phase("Discovery", DISCOVERY_PING_COUNT)
     live_table._render(force=True)
 
-    # Start internet pings in a separate thread immediately
-    internet_thread = None
-    if _internet_hosts and ping_count > 0:
-        internet_thread = threading.Thread(
-            target=ping_internet_hosts, args=(live_table, _internet_hosts, ping_count), daemon=True
-        )
-        internet_thread.start()
+    # Start internet pings in a separate thread immediately.
+    if _internet_hosts and ping_count != 0:
+        threading.Thread(
+            target=ping_internet_hosts,
+            args=(live_table, _internet_hosts, internet_count, interval_ms),
+            daemon=True
+        ).start()
 
     if high_pressure:
-        # High pressure: all devices simultaneously, up to N subthreads per device
-        max_workers = min(MAX_WORKERS_INIT, len(ip_range) * HIGH_PRESSURE_SUBTHREADS_PER_DEVICE)
-        executor = ThreadPoolExecutor(max_workers=max_workers)
-        futures = {
-            executor.submit(
-                ping_host_multiple, ip, ping_count, live_table, control, local_ip, local_mac
-            ): ip for ip in ip_range
-        }
-        completed = 0
-
-        for dev in as_completed(futures):
-            if control and control.should_exit_task():
-                break
-            if control:
-                control.wait_if_paused()
-            completed += 1
-            total_done = completed * ping_count
-            live_table.set_total_pings(total_done, analysis_pings + internet_pings)
-            if time.time() - last_group_calc > GROUP_CALC_INTERVAL_SECONDS:
-                live_table.calculate_groups()
-                last_group_calc = time.time()
-            live_table.set_completed(completed)
-            live_table._try_render()
-
-        executor.shutdown(wait=False)
+        # High pressure: all devices at once, several subthreads per device.
+        hp_workers = min(MAX_WORKERS_INIT, len(ip_range) * HIGH_PRESSURE_SUBTHREADS_PER_DEVICE)
+        with ThreadPoolExecutor(max_workers=hp_workers) as executor:
+            futures = {
+                executor.submit(ping_host_multiple, ip, ping_count, live_table,
+                                control, local_ip, local_mac, interval_ms): ip
+                for ip in ip_range
+            }
+            for _ in as_completed(futures):
+                if control and control.should_exit_task():
+                    break
+                if control:
+                    control.wait_if_paused()
+                live_table.bump_completed()
+                _maybe_recalc_groups()
     else:
-        # Standard mode: Discovery phase (1 ping each)
-        executor = ThreadPoolExecutor(max_workers=init_workers)
-        futures = {
-            executor.submit(
-                ping_host_multiple, ip, DISCOVERY_PING_COUNT, live_table, control, local_ip, local_mac
-            ): ip for ip in ip_range
-        }
-        completed = 0
+        # Pipeline: discover (1 ping each) and, the moment a host answers, hand it
+        # straight to the analysis pool — analysis of the first hosts starts while
+        # the rest of the subnet is still being discovered.
+        analyse = ping_count != 0
+        analysis_executor = ThreadPoolExecutor(max_workers=max_workers) if analyse else None
+        analysis_futures = []
 
-        for dev in as_completed(futures):
+        def _on_analysis_done(_fut):
+            live_table.bump_completed()
+
+        disc_executor = ThreadPoolExecutor(max_workers=init_workers)
+        disc_futures = {
+            disc_executor.submit(ping_host_multiple, ip, DISCOVERY_PING_COUNT,
+                                 live_table, control, local_ip, local_mac, interval_ms): ip
+            for ip in ip_range
+        }
+        for fut in as_completed(disc_futures):
             if control and control.should_exit_task():
                 break
             if control:
                 control.wait_if_paused()
-            completed += 1
-            live_table.set_total_pings(completed * DISCOVERY_PING_COUNT, discovery_pings + analysis_pings + internet_pings)
-            if time.time() - last_group_calc > GROUP_CALC_INTERVAL_SECONDS:
-                live_table.calculate_groups()
-                last_group_calc = time.time()
-            live_table.set_completed(completed)
-            live_table._try_render()
+            ip = disc_futures[fut]
+            online = ip in live_table.devices and live_table.devices[ip].ping_status
+            if analyse and online:
+                af = analysis_executor.submit(ping_host_multiple, ip, ping_count,
+                                              live_table, control, local_ip, local_mac, interval_ms)
+                af.add_done_callback(_on_analysis_done)
+                analysis_futures.append(af)
+            else:
+                # Offline host (or analysis disabled): processed now; its planned
+                # analysis pings count as skipped on the pings bar.
+                if analyse and not infinite:
+                    live_table.record_skipped(analysis_per_ip)
+                live_table.bump_completed()
+            _maybe_recalc_groups()
+        disc_executor.shutdown(wait=False)
 
-        executor.shutdown(wait=False)
-
-        # Analysis phase (full ping_count per device)
-        if ping_count > 0 and not (control and control.should_exit_task()):
+        # Drain the analysis pool. bump_completed already fired via callbacks; here
+        # we just wait, keep groups fresh, and honour stop/pause.
+        if analysis_executor is not None:
             live_table.set_phase("Analysis", ping_count)
-            live_table.set_completed(0, force_render=True)
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = {
-                    executor.submit(
-                        ping_host_multiple, ip, ping_count, live_table, control, local_ip, local_mac
-                    ): ip for ip in ip_range
-                }
-                completed = 0
-                for dev in as_completed(futures):
-                    if control and control.should_exit_task():
-                        break
-                    if control:
-                        control.wait_if_paused()
-                    completed += 1
-                    total_done = discovery_pings + internet_pings + (completed * ping_count)
-                    live_table.set_total_pings(total_done, discovery_pings + analysis_pings + internet_pings)
-                    if time.time() - last_group_calc > GROUP_CALC_INTERVAL_SECONDS:
-                        live_table.calculate_groups()
-                        last_group_calc = time.time()
-                    live_table.set_completed(completed)
-                    live_table._try_render()
+            for _ in as_completed(analysis_futures):
+                if control and control.should_exit_task():
+                    break
+                if control:
+                    control.wait_if_paused()
+                _maybe_recalc_groups()
+            analysis_executor.shutdown(wait=False)
 
     live_table.calculate_groups()
 
-    # Enrich online devices with MAC/hostname from previous scan (same router/network).
-    # Offline-only previous devices are intentionally not merged — we only show
-    # devices that responded in the current scan.
+    # Known-devices DB: remember everything seen on this network, then list the
+    # network's known devices (incl. offline) so they always show up.
     gateway_mac = None
     if live_table.gateway_ip and live_table.gateway_ip in live_table.devices:
         gateway_mac = live_table.devices[live_table.gateway_ip].mac_address
-    previous_devices = load_previous_devices(output_dir, gateway_mac)
-    with live_table.lock:
-        for prev_dev in previous_devices:
-            if prev_dev.ip in live_table.devices:
-                curr = live_table.devices[prev_dev.ip]
-                # Only enrich devices that are ONLINE in the current scan
-                if not curr.ping_status:
-                    continue
-                if (curr.mac_address is None or curr.mac_address == UNKNOWN_VALUE) and prev_dev.mac_address and prev_dev.mac_address != UNKNOWN_VALUE:
-                    curr.mac_address = prev_dev.mac_address
-                if (curr.hostname is None or curr.hostname == UNKNOWN_VALUE) and prev_dev.hostname and prev_dev.hostname != UNKNOWN_VALUE:
-                    curr.hostname = prev_dev.hostname
+    if use_db and gateway_mac and gateway_mac != UNKNOWN_VALUE:
+        _merge_known_devices(live_table, db_path, gateway_mac)
 
     live_table.calculate_groups()
-    # Ensure progress bar shows 100% at end
-    live_table.set_total_pings(live_table.total_pings_target, live_table.total_pings_target)
+    # Ensure BOTH progress bars are completely filled at the end (skip in ∞ mode —
+    # there is no finite target to fill).
+    if not infinite:
+        live_table.finalize_progress()
     live_table.stop_refresh_timer()
     live_table._render(force=True)
     return live_table
@@ -1958,8 +3176,11 @@ def scan_subnet(
 
 def save_results(live_table: LiveTable, network_info: Dict, output_dir: str = ".") -> str:
     """Save scan results to a text file."""
+    # Create the output directory (e.g. ./Scans) if it does not exist yet
+    if output_dir and output_dir not in (".", "./"):
+        os.makedirs(output_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = os.path.join(output_dir, f"network_scan_{timestamp}.txt")
+    filename = os.path.join(output_dir, f"{TXT_FILENAME_PREFIX}{timestamp}.txt")
 
     lines = [
         "=" * live_table.table_width,
@@ -1972,7 +3193,9 @@ def save_results(live_table: LiveTable, network_info: Dict, output_dir: str = ".
     ]
 
     lines.append(f"Interface:      {network_info.get('interface', UNKNOWN_VALUE)}")
-    lines.append(f"IP Address:     {network_info.get('ip', UNKNOWN_VALUE)}")
+    local_host = platform.node() or UNKNOWN_VALUE
+    ip_val = network_info.get('ip', UNKNOWN_VALUE)
+    lines.append(f"IP Address:     {ip_val:<18}Hostname:  {local_host}")
 
     gateway = network_info.get('gateway')
     if gateway:
@@ -1997,16 +3220,91 @@ def save_results(live_table: LiveTable, network_info: Dict, output_dir: str = ".
     return filename
 
 
+# Column headers for the CSV export, in order.
+CSV_COLUMNS: Tuple[str, ...] = (
+    "ip", "status", "hostname", "vendor", "mac",
+    "ping_avg_ms", "ping_min_ms", "ping_max_ms", "last_ping_ms",
+    "pings_done", "pings_target", "from_db"
+)
+
+
+def save_results_csv(live_table: LiveTable, output_dir: str = ".") -> str:
+    """Write the scan results as a machine-readable CSV (online + known devices).
+    Numbers use a dot decimal so the file parses cleanly in any locale/tool."""
+    if output_dir and output_dir not in (".", "./"):
+        os.makedirs(output_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = os.path.join(output_dir, f"{CSV_FILENAME_PREFIX}{timestamp}.csv")
+
+    def _num(v):
+        return "" if v is None else f"{v:.2f}"
+
+    with live_table.lock:
+        devices = sorted(live_table.devices.values(),
+                         key=lambda d: tuple(map(int, d.ip.split('.')))
+                         if re.match(r'^\d+\.\d+\.\d+\.\d+$', d.ip) else (0, 0, 0, 0))
+        with open(filename, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(CSV_COLUMNS)
+            for d in devices:
+                if not d.ping_status and not d.from_db:
+                    continue
+                mac = d.mac_address if (d.mac_address and d.mac_address != UNKNOWN_VALUE) else ""
+                hostname = d.hostname if (d.hostname and d.hostname != UNKNOWN_VALUE) else ""
+                target = (INFINITE_SYMBOL if d.target_pings == PING_COUNT_INFINITE
+                          else d.target_pings)
+                writer.writerow([
+                    d.ip,
+                    STATUS_ONLINE if d.ping_status else STATUS_OFFLINE,
+                    hostname,
+                    lookup_mac_vendor(mac) or "",
+                    mac,
+                    _num(d.ping_stats.get('avg')),
+                    _num(d.ping_stats.get('min')),
+                    _num(d.ping_stats.get('max')),
+                    _num(d.last_ping),
+                    d.current_pings,
+                    target,
+                    "1" if d.from_db else "0",
+                ])
+    return filename
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# Absolute path of the most recent saved report — printed under the controls.
+_last_results_path: Optional[str] = None
+
+
+def _hard_clear() -> None:
+    """Fully clear the console (screen + scrollback) so only the next frame is
+    visible. ANSI 3J is unreliable on legacy consoles, so fall back to cls."""
+    try:
+        if platform.system() == "Windows":
+            # Fixed literal command, no user input → no injection risk. `cls` is a
+            # shell builtin (not an .exe), so subprocess.run([...]) can't run it.
+            os.system('cls')  # noqa: S605
+        else:
+            sys.stdout.write("\033[3J\033[2J\033[H")
+            sys.stdout.flush()
+    except Exception:
+        pass
+
+
 def main(ping_count: int = DEFAULT_PING_COUNT, high_pressure: bool = False) -> str:
     """Run a network scan."""
+    _ensure_classic_console()  # re-host under conhost (Win Terminal can't resize)
+    _init_console_encoding()   # UTF-8 stdout BEFORE any glyphs are written
     _ensure_conf_template()
     cfg = load_config_manager()
-    cfg.print_warnings()       # Show any range/type corrections immediately
-    print_config_info(cfg)
+    cfg.print_warnings()       # Show range/type corrections if any
+
+    # Pick the largest readable font at which the table fits, before the live
+    # table sizes the window. Preferred height: [display] console_font_size (0 off).
+    _fit_console_font(TABLE_WIDTH + 4,
+                      max_height=cfg.get_int('console_font_size', CONSOLE_FONT_HEIGHT, 'display'))
 
     cfg_ping_count = cfg.get_int('ping_count', DEFAULT_PING_COUNT, 'scanning')
     if ping_count == DEFAULT_PING_COUNT and cfg_ping_count != DEFAULT_PING_COUNT:
@@ -2015,67 +3313,97 @@ def main(ping_count: int = DEFAULT_PING_COUNT, high_pressure: bool = False) -> s
     if not high_pressure and cfg_high_pressure:
         high_pressure = True
 
+    # Build the live table FIRST, then draw an initial frame immediately.
+    # LiveTable() resizes/centres the console window, so the UI appears instantly —
+    # the user never waits on a blank screen while the PowerShell-based network
+    # detection runs (slow on a cold first start). The keyboard listener is started
+    # right after, with the table, so P/Q/ESC work from the very first frame.
+    control = ScannerControl()
+    live_table = LiveTable()
+    live_table.render_throttle = cfg.get_float('refresh_rate', RENDER_THROTTLE_SECONDS, 'scanning')
+    live_table.set_phase("Discovery", DISCOVERY_PING_COUNT)
+    live_table._render(force=True, clear_first=True)
+    live_table.start_refresh_timer()
+
+    listener = threading.Thread(target=input_listener, args=(control, live_table), daemon=True)
+    listener.start()
+
+    # Network detection (PowerShell — can take a moment on the first run). The
+    # refresh thread keeps redrawing, so the header fills in as soon as it's ready.
     interface = get_ethernet_interface() or "eth0"
     network_info = get_network_info(interface)
     ip = network_info.get('ip')
-    cfg_subnet = cfg.get_str('subnet', '', 'network')
-    # Strip CIDR suffix if present (e.g. "192.168.2.0/24" → "192.168.2")
-    if cfg_subnet and '/' in cfg_subnet:
-        cfg_subnet = '.'.join(cfg_subnet.split('/')[0].split('.')[:SUBNET_OCTET_COUNT])
-    subnet = cfg_subnet if cfg_subnet else get_subnet(ip)
 
-    if not subnet:
+    def _to_prefix(value: str) -> str:
+        # "192.168.1.0/24" / "192.168.1.0" / "192.168.1" → "192.168.1"
+        base = value.split('/')[0]
+        return '.'.join(base.split('.')[:SUBNET_OCTET_COUNT])
+
+    # The auto-detected own subnet is ALWAYS scanned first. Any subnets from the
+    # config (subnet, subnet_2, subnet_3, …) are appended afterwards. Duplicates
+    # are removed while preserving order, so the own subnet stays on top.
+    own_prefix = get_subnet(ip)
+    cfg_subnets = [_to_prefix(s) for s in cfg.get_subnets() if _to_prefix(s)]
+    subnet_prefixes, _seen = [], set()
+    for p in ([own_prefix] if own_prefix else []) + cfg_subnets:
+        if p and p not in _seen:
+            _seen.add(p)
+            subnet_prefixes.append(p)
+
+    if not subnet_prefixes:
+        live_table.stop_refresh_timer()
         print("Error: Could not determine subnet")
         return 'exit'
 
-    control = ScannerControl()
-    listener = threading.Thread(target=input_listener, args=(control,), daemon=True)
-    listener.start()
+    # Subnets being scanned, as CIDR — shown next to the title (request 1)
+    scanned_subnets = [f"{p}.0/24" for p in subnet_prefixes]
 
-    live_table = LiveTable()
-    live_table.render_throttle = cfg.get_float('refresh_rate', RENDER_THROTTLE_SECONDS, 'scanning')
     live_table.set_network_info(network_info)
+    live_table.scanned_subnets = scanned_subnets
     gateway = network_info.get('gateway')
     if gateway:
         live_table.set_gateway(gateway)
 
-    # Initial internet latency check
+    # Populate the device count so the full layout (incl. Devices bar) is visible.
+    hosts_per_subnet = SUBNET_LAST_IP - SUBNET_FIRST_IP + 1
+    live_table.total_count = len(subnet_prefixes) * hosts_per_subnet
+
+    # DB config — resolved once, shared between pre-load and scan_subnet.
+    cfg_use_db = cfg.get_bool('known_devices_db', True, 'database')
+    db_path = KNOWN_DEVICES_DB_FILE
+
+    # Pre-load known devices from DB so they appear as OFFLINE right at startup.
+    # When the scan pings them successfully they transition to ONLINE automatically
+    # via update_device() — no special handling needed in the scan loop.
+    if cfg_use_db and gateway:
+        known_gw_mac = _get_network_mac_from_db(db_path, gateway)
+        if known_gw_mac:
+            for kd in load_known_devices(db_path, known_gw_mac):
+                with live_table.lock:
+                    if kd.ip not in live_table.devices:
+                        live_table.devices[kd.ip] = kd
+            live_table.known_network = True
+            live_table.calculate_groups()   # resolves gateway_color from stored hostname
+
+    # Widen + recentre with the pre-loaded device data already in place.
+    live_table.fit_width()
+    _center_console_window()
+    live_table._render(force=True, clear_first=True)
+
+    # Internet latency: quick pre-fill in the background — never blocks the scan.
     cfg_enable_inet = cfg.get_bool('enable_internet_ping', True, 'internet')
-    internet_unreachable = False
     if cfg_enable_inet:
         raw_hosts = cfg.get_str('internet_hosts', '', 'internet')
         internet_hosts = [h.strip() for h in raw_hosts.split(',') if h.strip()] if raw_hosts else INTERNET_PING_HOSTS
-        for host_ip in internet_hosts:
-            lats: List[float] = []
-            for _ in range(INITIAL_INTERNET_PING_COUNT):
-                try:
-                    timeout_arg = WINDOWS_PING_TIMEOUT_MS if platform.system() == "Windows" else UNIX_PING_TIMEOUT_S
-                    cmd = [
-                        "ping",
-                        "-n" if platform.system() == "Windows" else "-c", "1",
-                        "-w" if platform.system() == "Windows" else "-W", str(timeout_arg),
-                        host_ip
-                    ]
-                    res = _run(cmd, timeout=PING_TIMEOUT_SECONDS)
-                    if res.returncode == 0:
-                        m = re.search(r'time[=<:]\s*([\d.]+)\s*ms', res.stdout, re.IGNORECASE)
-                        if m:
-                            lats.append(float(m.group(1)))
-                except Exception:
-                    pass
-            if lats:
-                live_table.set_public_latency(host_ip, {
-                    'min': min(lats),
-                    'max': max(lats),
-                    'avg': sum(lats) / len(lats)
-                })
-            else:
-                internet_unreachable = True
+        threading.Thread(
+            target=prefill_internet_latency, args=(live_table, internet_hosts), daemon=True
+        ).start()
     else:
         internet_hosts = []
 
+    output_dir = cfg.get_str('output_directory', DEFAULT_OUTPUT_DIR, 'output')
     live_table = scan_subnet(
-        subnet,
+        subnet_prefixes,
         ping_count=ping_count,
         max_workers=cfg.get_int('ping_threads', MAX_WORKERS_ANALYSIS, 'scanning'),
         init_workers=cfg.get_int('init_ping_threads', MAX_WORKERS_INIT, 'scanning') or MAX_WORKERS_INIT,
@@ -2085,28 +3413,45 @@ def main(ping_count: int = DEFAULT_PING_COUNT, high_pressure: bool = False) -> s
         local_mac=network_info.get('mac'),
         high_pressure=high_pressure,
         internet_hosts=internet_hosts if cfg_enable_inet else [],
-        output_dir=cfg.get_str('output_directory', '.', 'output'),
-        file_output=cfg.get_bool('file_output', True, 'output')
+        output_dir=output_dir,
+        file_output=cfg.get_bool('file_output', True, 'output'),
+        interval_ms=cfg.get_int('ping_interval_ms', PING_INTERVAL_MS, 'scanning'),
+        use_db=cfg_use_db,
+        db_path=db_path
     )
 
     control.shutdown = True
-    if control.restart_requested:
-        return 'restart'
 
-    # Internet reachability warning
-    if cfg_enable_inet and internet_unreachable:
-        print(f"\n{COLOR_YELLOW}Warning: Some internet hosts were unreachable. Check your network connection.{COLOR_RESET}")
+    # Internet reachability warning — any configured host without a latency result
+    if cfg_enable_inet and internet_hosts:
+        reachable = set(live_table.public_latencies.keys())
+        if any(h not in reachable for h in internet_hosts):
+            print(f"\n{COLOR_YELLOW}Warning: Some internet hosts were unreachable. Check your network connection.{COLOR_RESET}")
 
-    # Phase 3: Save TXT
-    cfg_file_output = cfg.get_bool('file_output', True, 'output')
-    if cfg_file_output:
+    # Phase 3: Save TXT (and optionally CSV) — always, even after an early Q stop.
+    # The path is shown UNDER the controls (not here), so it isn't wiped by the
+    # final clear; we just record it.
+    global _last_results_path
+    _last_results_path = None
+    if cfg.get_bool('file_output', True, 'output'):
         live_table.set_phase("Save TXT", 0)
-        filename = save_results(live_table, network_info, cfg.get_str('output_directory', '.', 'output'))
-        print(f"\nResults saved to: {COLOR_GREEN}{filename}{COLOR_RESET}")
+        filename = save_results(live_table, network_info, output_dir)
+        _last_results_path = os.path.abspath(filename)
+        if cfg.get_bool('export_csv', False, 'output'):
+            save_results_csv(live_table, output_dir)
 
-    # Phase 4: Ready
+    # Phase 4: Ready — hard-clear so ONLY the final report frame remains (no
+    # leftover second frame from the scan), then render once.
     live_table.set_phase("Ready", 0)
-    live_table._render(force=True, move_home=False)
+    _hard_clear()
+    live_table._render(force=True, clear_first=True)
+
+    # Q during scan → show final state + exit (no restart menu). Print the saved
+    # path here since the controls menu won't be shown in that case.
+    if control.stop_requested:
+        if _last_results_path:
+            print(f"\nResults saved to: {COLOR_GREEN}{_last_results_path}{COLOR_RESET}")
+        return 'exit'
     return 'completed'
 
 
@@ -2120,33 +3465,40 @@ def show_restart_options() -> str:
     r = COLOR_RESET
     b = COLOR_BOLD
     rd = COLOR_RED
-    col_w = 25
     cols = 4
+    gap = 3  # spaces between columns
 
+    pu = COLOR_PURPLE
     # Row 1: [1] 10 pings, [2] 100 pings, [3] 1.000 pings, [4] 10.000 pings
     row1 = [
-        f"[{k}1{r}] {b}{PING_COUNT_OPTIONS[0]:,}{r} pings",
-        f"[{k}2{r}] {b}{PING_COUNT_OPTIONS[1]:,}{r} pings",
-        f"[{k}3{r}] {b}{PING_COUNT_OPTIONS[2]:,}{r} pings",
-        f"[{k}4{r}] {b}{PING_COUNT_OPTIONS[3]:,}{r} pings",
+        f"[{k}1{r}] {b}{format_num(PING_COUNT_OPTIONS[0])}{r} pings",
+        f"[{k}2{r}] {b}{format_num(PING_COUNT_OPTIONS[1])}{r} pings",
+        f"[{k}3{r}] {b}{format_num(PING_COUNT_OPTIONS[2])}{r} pings",
+        f"[{k}4{r}] {b}{format_num(PING_COUNT_OPTIONS[3])}{r} pings",
     ]
-    # Row 2: [5] 100.000 pings, [6] 1.000.000 pings, [h] HIGH PRESSURE, [q/ESC] Quit
+    # Row 2: [5] 100.000 pings, [8] ∞ unlimited, [h] HIGH PRESSURE, [q/ESC] Quit
     row2 = [
-        f"[{k}5{r}] {b}{PING_COUNT_OPTIONS[4]:,}{r} pings",
-        f"[{k}6{r}] {b}{PING_COUNT_OPTIONS[5]:,}{r} pings",
+        f"[{k}5{r}] {b}{format_num(PING_COUNT_OPTIONS[4])}{r} pings",
+        f"[{k}8{r}] {pu}{INFINITE_SYMBOL} Unlimited{r}",
         f"[{k}h{r}] {rd}HIGH PRESSURE{r}",
-        f"[{k}q{r}/ESC{r}] Quit",
+        f"[{k}q{r}/ESC] Quit",
     ]
 
-    for row in [row1, row2]:
-        parts = []
-        for item in row:
-            pad = max(0, col_w - get_visible_len(item))
-            parts.append(item + " " * pad)
-        line = "".join(parts)
-        vis_len = get_visible_len(line)
-        indent = (TABLE_WIDTH - vis_len) // 2
-        print(" " * max(0, indent) + line)
+    # One column width for ALL cells → columns line up vertically; the whole
+    # block shares a single centred indent so it sits centred as one unit.
+    col_w = max(get_visible_len(item) for item in row1 + row2)
+    block_w = col_w * cols + gap * (cols - 1)
+    indent = " " * max(0, (TABLE_WIDTH - block_w) // 2)
+
+    print()
+    for row in (row1, row2):
+        cells = [item + " " * max(0, col_w - get_visible_len(item)) for item in row]
+        print(indent + (" " * gap).join(cells).rstrip())
+    print()
+
+    # Under the controls: where the report was saved (full path).
+    if _last_results_path:
+        print(f"Results saved to: {COLOR_GREEN}{_last_results_path}{COLOR_RESET}\n")
 
     if platform.system() == "Windows":
         if _msvcrt is None:
@@ -2160,7 +3512,7 @@ def show_restart_options() -> str:
                 ch = raw.decode('utf-8', errors='ignore').lower()
                 if ch in ('\x1b', '\x03'):
                     return 'q'
-                if ch in ('1', '2', '3', '4', '5', '6', 'h', 'q'):
+                if ch in ('1', '2', '3', '4', '5', '8', 'h', 'q'):
                     return ch
             time.sleep(KEY_SLEEP_INTERVAL)
 
@@ -2178,7 +3530,7 @@ def show_restart_options() -> str:
                 inp = os.read(fd, INPUT_READ_SIZE).decode('utf-8', errors='ignore').lower()
                 if not inp:
                     continue
-                for key in ['1', '2', '3', '4', '5', '6', 'h', 'q']:
+                for key in ['1', '2', '3', '4', '5', '8', 'h', 'q']:
                     if key in inp:
                         return key
                 if '\x1b' in inp:
@@ -2195,49 +3547,26 @@ def show_restart_options() -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
+    # Maps a menu key to (ping_count, high_pressure) for the next run.
+    MENU_ACTIONS = {
+        '1': (PING_COUNT_OPTIONS[0], False),
+        '2': (PING_COUNT_OPTIONS[1], False),
+        '3': (PING_COUNT_OPTIONS[2], False),
+        '4': (PING_COUNT_OPTIONS[3], False),
+        '5': (PING_COUNT_OPTIONS[4], False),
+        '8': (PING_COUNT_INFINITE,  False),   # ∞ — ping until stopped
+        'h': (PING_COUNT_OPTIONS[0], True),   # HIGH PRESSURE
+    }
     cp = DEFAULT_PING_COUNT
     high_pressure = False
     while True:
         status = main(ping_count=cp, high_pressure=high_pressure)
-        if status == 'restart':
-            cp = DEFAULT_PING_COUNT
-            high_pressure = False
-            continue
-        elif status == 'exit':
+        if status == 'exit':
             break
-
-        if sys.stdin.isatty():
-            choice = show_restart_options()
-            if choice == '1':
-                cp = PING_COUNT_OPTIONS[0]
-                high_pressure = False
-                continue
-            elif choice == '2':
-                cp = PING_COUNT_OPTIONS[1]
-                high_pressure = False
-                continue
-            elif choice == '3':
-                cp = PING_COUNT_OPTIONS[2]
-                high_pressure = False
-                continue
-            elif choice == '4':
-                cp = PING_COUNT_OPTIONS[3]
-                high_pressure = False
-                continue
-            elif choice == '5':
-                cp = PING_COUNT_OPTIONS[4]
-                high_pressure = False
-                continue
-            elif choice == '6':
-                cp = PING_COUNT_OPTIONS[5]
-                high_pressure = False
-                continue
-            elif choice == 'h':
-                cp = PING_COUNT_OPTIONS[0]
-                high_pressure = True
-                continue
-            elif choice == 'q':
-                print("\nExiting... Goodbye!")
-                break
-        else:
+        if not sys.stdin.isatty():
             break
+        choice = show_restart_options()
+        if choice == 'q':
+            print("\nExiting... Goodbye!")
+            break
+        cp, high_pressure = MENU_ACTIONS.get(choice, (DEFAULT_PING_COUNT, False))

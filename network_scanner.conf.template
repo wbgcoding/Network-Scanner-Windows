@@ -1,84 +1,81 @@
 # ═══════════════════════════════════════════════════════════════════════════════
-# Network Scanner Configuration
-# ═══════════════════════════════════════════════════════════════════════════════
-#
-# Copy this file to 'network_scanner.conf' and adjust values.
-# Lines starting with # or ; are ignored.
-# Invalid values are automatically corrected to sensible defaults.
-#
+# Network Scanner — configuration file
+# Copy this file to 'network_scanner.conf' and adjust the values.
+# Lines starting with # or ; are ignored. Out-of-range or invalid values are
+# corrected to the defaults shown below.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-[scanning]
-# ── THREADS ────────────────────────────────────────────────────────────────────
-# init_ping_threads: Threads used during the initial discovery phase.
-#   0  = One thread per IP address (up to 254 threads)
-#   >0 = Exact thread count (capped at 1000)
-# Default: 254
-init_ping_threads = 254
+# ── THREADS ──────────────────────────────────────────────────────────────────
+# init_ping_threads  Threads used during the discovery phase. 0 = one per IP.
+#   Range: 0-1000 | Default: 254
+#init_ping_threads = 254
 
-# ping_threads: Threads used during the analysis (full ping) phase.
-#   Range: 1 to 1000
-# Default: 100
-ping_threads = 100
+# ping_threads  Threads used during the analysis phase.
+#   Range: 1-1000 | Default: 100
+#ping_threads = 100
 
 # ── PING ───────────────────────────────────────────────────────────────────────
-# init_ping_count: Number of pings per device during discovery.
-#   Range: 1 to 100
-# Default: 1
-init_ping_count = 1
+# init_ping_count  Pings per device during discovery.
+#   Range: 1-100 | Default: 1
+#init_ping_count = 1
 
-# ping_count: Number of pings per device during analysis.
-#   Range: 1 to 10,000,000
-# Default: 10
-ping_count = 10
+# ping_count  Pings per device during analysis.
+#   Range: 1-10000000 | Default: 10
+#ping_count = 10
 
-# refresh_rate: Minimum seconds between screen redraws.
-#   Range: 0.1 to 60.0
-# Default: 1.0
-refresh_rate = 1.0
+# ping_interval_ms  Pause between two pings to the SAME host, in milliseconds.
+#   Keeps fast LAN hosts from racing to 100%. Range: 0-10000 | Default: 100
+#ping_interval_ms = 100
+
+# refresh_rate  Minimum seconds between screen redraws.
+#   Range: 0.1-60.0 | Default: 1.0
+#refresh_rate = 1.0
+
+# console_font_size  Console font height in pixels forced on startup
+#   (0 = leave the console font untouched). Range: 0-72 | Default: 18
+#console_font_size = 18
+
+# ── NETWORK ────────────────────────────────────────────────────────────────────
+# subnet  Target subnet in CIDR notation. Leave empty for auto-detection.
+#   Example: 192.168.1.0/24
+#subnet = 192.168.1.0/24
+
+# Additional subnets scanned in the same run, in order.
+#subnet_2 = 10.0.0.0/24
+#subnet_3 = 172.16.0.0/24
+#subnet_4 = 192.168.2.0/24
 
 # ── HIGH PRESSURE MODE ─────────────────────────────────────────────────────────
-# high_pressure_mode: Scan all devices in parallel with subthreads.
-#   true  = All devices ping simultaneously (max 10 subthreads each)
-#   false = Normal two-phase scan (discovery + analysis)
-# Default: false
-high_pressure_mode = false
+# high_pressure_mode  Ping every device at once with several subthreads each.
+#   true  = maximum throughput (high CPU/network load)
+#   false = pipelined scan (discovery + analysis)  | Default: false
+#high_pressure_mode = false
 
-[network]
-# ── NETWORK ────────────────────────────────────────────────────────────────────
-# subnet: Target subnet in CIDR notation (e.g. 192.168.1.0/24).
-#   Leave empty to enable automatic detection.
-#   Examples:
-#     subnet = 192.168.1.0/24
-#     subnet = 10.0.0.0/24
-subnet = 
-
-# Additional subnets to scan in the same run (planned feature).
-# subnet_2 = 192.168.1.0/24
-
-[output]
 # ── OUTPUT ─────────────────────────────────────────────────────────────────────
-# output_directory: Where scan result files are saved.
-#   Use '.' for current directory or an absolute path.
-#   The directory is created automatically if it does not exist.
-# Default: .
-output_directory = .
+# output_directory  Folder for scan results (created automatically).
+#   Default: ./Scans
+output_directory = ./Scans
 
-# file_output: Save results to a text file after scanning.
-#   true  = Write network_scan_YYYYMMDD_HHMMSS.txt
-#   false = Only display results on screen
-# Default: true
-file_output = true
+# file_output  Write a plain-text report after the scan.
+#   Default: true
+#file_output = true
 
-[internet]
-# ── INTERNET HOSTS ─────────────────────────────────────────────────────────────
-# enable_internet_ping: Ping external hosts for comparison.
-#   true  = Ping configured internet hosts in parallel
-#   false = Skip internet latency checks
-# Default: true
-enable_internet_ping = true
+# export_csv  Also write a machine-readable CSV file next to the report.
+#   Default: false
+#export_csv = false
 
-# internet_hosts: Comma-separated list of IPs to ping.
-#   Only used when enable_internet_ping = true
-# Default: 1.1.1.1, 8.8.8.8, 8.8.4.4, 9.9.9.9
-internet_hosts = 1.1.1.1, 8.8.8.8, 8.8.4.4, 9.9.9.9
+# ── KNOWN-DEVICES DATABASE ─────────────────────────────────────────────────────
+# known_devices_db  Remember devices per network (keyed by the gateway MAC) in a
+#   local SQLite file. When the same router is recognised again, its known
+#   devices are listed even while offline, and the database is updated each run.
+#   Default: true
+#known_devices_db = true
+
+# ── INTERNET PING ──────────────────────────────────────────────────────────────
+# enable_internet_ping  Ping external hosts to measure internet latency.
+#   Default: true
+#enable_internet_ping = true
+
+# internet_hosts  Comma-separated list of IPv4 addresses.
+#   Default: 8.8.8.8, 8.8.4.4, 1.1.1.1, 9.9.9.9
+#internet_hosts = 8.8.8.8, 8.8.4.4, 1.1.1.1, 9.9.9.9

@@ -5,23 +5,30 @@ __pycache__/
 dist/
 build/
 
-# Scanner output
+# Scanner output / local scan data (never publish captured network data)
+Scans/
 network_scan_*.txt
+network_scan_*.csv
+*.csv
 
-# Config (contains local network info)
+# Known-devices database (local, contains your network's devices)
+*.db
+known_devices.db
+
+# Config with local network info. The .template is tracked; the live .conf is not.
 network_scanner.conf
+config.ini
+
+# Generic text dumps (scan reports etc.) — docs use .md so they stay tracked.
+*.txt
 
 # IDE
 .vscode/
 .idea/
 
-# Claude
+# Claude / local tooling
 CLAUDE.md
 .claude/
 .remember/
 .omg/
-
-
 BACKUP.bat
-*.txt
-*.conf

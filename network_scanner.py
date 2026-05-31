@@ -788,6 +788,7 @@ _CONF_RANGES: Dict[str, Tuple] = {
     'init_ping_count':   (1, 100),
     'ping_count':        (1, 10_000_000),
     'ping_interval_ms':  (0, 10_000),   # pause between pings to the same host
+    'offline_after_failed_pings': (1, 100),  # consecutive misses → mark offline
     'refresh_rate':      (0.1, 60.0),
     'console_font_size': (0, 72),   # 0 = leave the console font untouched
 }
@@ -1014,6 +1015,10 @@ _CONF_TEMPLATE_CONTENT = """\
 #   Stops fast LAN hosts from finishing instantly. Range: 0-10000 | Default: 100
 #ping_interval_ms = 100
 
+# offline_after_failed_pings  Mark a device OFFLINE after this many consecutive
+#   pings get no reply. Range: 1-100 | Default: 5
+#offline_after_failed_pings = 5
+
 # init_ping_count  Pings per device during the quick discovery sweep.
 #   Range: 1-100 | Default: 1
 #init_ping_count = 1
@@ -1106,6 +1111,7 @@ class Device:
     is_offline: bool = False
     last_ping: Optional[float] = None   # most recently measured latency (ms)
     from_db: bool = False   # known device loaded from the DB (may be offline)
+    seen: bool = False      # answered at least once this scan (stays listed if it later drops)
 
 
 class ScannerControl:
@@ -1419,6 +1425,74 @@ def get_default_gateway_fast() -> Optional[str]:
         nh = row.dwForwardNextHop
         gw = f"{nh & 0xFF}.{(nh >> 8) & 0xFF}.{(nh >> 16) & 0xFF}.{(nh >> 24) & 0xFF}"
         return gw if gw != "0.0.0.0" else None
+    except Exception:
+        return None
+
+
+def get_local_mac_fast(local_ip: str) -> Optional[str]:
+    """Return THIS machine's MAC for the adapter holding `local_ip`, read directly
+    from the IP Helper API (GetAdaptersInfo). Reliable and instant — unlike the
+    own IP, which can't be resolved via ARP, and unlike parsing ipconfig/getmac
+    which is flaky under load (that left the local row showing 'Unknown').
+    Windows only; returns None elsewhere or on any failure."""
+    if platform.system() != "Windows" or not local_ip:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _IP_ADDR_STRING(ctypes.Structure):
+            pass
+        _IP_ADDR_STRING._fields_ = [
+            ("Next", ctypes.POINTER(_IP_ADDR_STRING)),
+            ("IpAddress", ctypes.c_char * 16),
+            ("IpMask", ctypes.c_char * 16),
+            ("Context", wintypes.DWORD),
+        ]
+
+        class _IP_ADAPTER_INFO(ctypes.Structure):
+            pass
+        _IP_ADAPTER_INFO._fields_ = [
+            ("Next", ctypes.POINTER(_IP_ADAPTER_INFO)),
+            ("ComboIndex", wintypes.DWORD),
+            ("AdapterName", ctypes.c_char * 260),
+            ("Description", ctypes.c_char * 132),
+            ("AddressLength", wintypes.UINT),
+            ("Address", ctypes.c_ubyte * 8),
+            ("Index", wintypes.DWORD),
+            ("Type", wintypes.UINT),
+            ("DhcpEnabled", wintypes.UINT),
+            ("CurrentIpAddress", ctypes.POINTER(_IP_ADDR_STRING)),
+            ("IpAddressList", _IP_ADDR_STRING),
+            ("GatewayList", _IP_ADDR_STRING),
+            ("DhcpServer", _IP_ADDR_STRING),
+            ("HaveWins", wintypes.BOOL),
+            ("PrimaryWinsServer", _IP_ADDR_STRING),
+            ("SecondaryWinsServer", _IP_ADDR_STRING),
+            ("LeaseObtained", ctypes.c_long),
+            ("LeaseExpires", ctypes.c_long),
+        ]
+
+        get_info = ctypes.windll.iphlpapi.GetAdaptersInfo
+        size = wintypes.ULONG(0)
+        get_info(None, ctypes.byref(size))           # query required buffer size
+        if size.value == 0:
+            return None
+        buf = ctypes.create_string_buffer(size.value)
+        if get_info(buf, ctypes.byref(size)) != 0:   # 0 = NO_ERROR
+            return None
+        adapter = ctypes.cast(buf, ctypes.POINTER(_IP_ADAPTER_INFO))
+        while adapter:
+            a = adapter.contents
+            node = ctypes.pointer(a.IpAddressList)
+            while node:
+                addr = node.contents
+                ip = addr.IpAddress.decode(errors="ignore").strip("\x00").strip()
+                if ip == local_ip and a.AddressLength:
+                    return "-".join(f"{a.Address[i]:02X}" for i in range(a.AddressLength))
+                node = addr.Next
+            adapter = a.Next
+        return None
     except Exception:
         return None
 
@@ -2024,6 +2098,7 @@ class LiveTable:
         self.gateway_color = GROUP_GATEWAY_COLOR_DEFAULT
         self.paused = False        # set by the input listener; drives the footer hint
         self.is_infinite = False   # ∞ mode: pings run until the user stops the scan
+        self.offline_after_failures = ANALYSIS_MAX_CONSECUTIVE_FAILURES  # misses → offline
         self.known_network = False # True when the DB recognised this network's gateway
         self._refresh_timer = None
         self._refresh_stop = threading.Event()
@@ -2155,6 +2230,17 @@ class LiveTable:
             dev = self.devices.get(self.local_ip) if self.local_ip else None
             if dev and (not dev.mac_address or dev.mac_address == UNKNOWN_VALUE):
                 dev.mac_address = mac
+        self.request_render()
+
+    def mark_offline(self, ip: str) -> None:
+        """Flag a device as offline (e.g. after too many consecutive misses) so the
+        table shows OFFLINE. It stays listed because it was 'seen' earlier; a later
+        successful ping flips it back online via update_device()."""
+        with self.lock:
+            d = self.devices.get(ip)
+            if d:
+                d.ping_status = False
+                d.is_offline = True
         self.request_render()
 
     def set_network_info(self, info: Dict):
@@ -2293,7 +2379,8 @@ class LiveTable:
                     target_pings=device.target_pings,
                     group_id=device.group_id,
                     is_offline=device.is_offline,
-                    last_ping=device.last_ping
+                    last_ping=device.last_ping,
+                    seen=device.seen
                 )
             else:
                 o = self.devices[device.ip]
@@ -2314,6 +2401,8 @@ class LiveTable:
                     o.mac_address = device.mac_address
                 if device.hostname and device.hostname != UNKNOWN_VALUE:
                     o.hostname = device.hostname
+                if device.seen:
+                    o.seen = True
                 o.current_pings = device.current_pings
                 o.target_pings = device.target_pings
             # The own IP can't be resolved via ARP, so whenever the local row is
@@ -2745,7 +2834,7 @@ class LiveTable:
             d = self.devices[ip]
             # Show devices that responded this scan, plus known devices loaded from
             # the DB and pinned IPs (these are listed even while offline).
-            if not d.ping_status and not d.from_db and ip not in pinned_order:
+            if not d.ping_status and not d.from_db and not d.seen and ip not in pinned_order:
                 continue
             online = d.ping_status
             status = STATUS_ONLINE if online else STATUS_OFFLINE
@@ -3045,7 +3134,7 @@ class LiveTable:
             sorted_ips = sorted(self.devices.keys(), key=_ip_sort_key)
             for ip in sorted_ips:
                 d = self.devices[ip]
-                if not d.ping_status and not d.from_db and ip not in pinned_order:
+                if not d.ping_status and not d.from_db and not d.seen and ip not in pinned_order:
                     continue
                 online = d.ping_status
                 status = STATUS_ONLINE if online else STATUS_OFFLINE
@@ -3355,6 +3444,8 @@ def _ping_loop(ip, count, lt, ctrl, local_ip, local_mac, dev, lats, system,
                 consecutive_failures = 0
                 succ += 1
                 dev.ping_status = True
+                dev.is_offline = False
+                dev.seen = True            # keep it listed even if it later drops
                 if lt:
                     lt.record_ping(True)
                 if succ == 1:
@@ -3383,17 +3474,23 @@ def _ping_loop(ip, count, lt, ctrl, local_ip, local_mac, dev, lats, system,
                 consecutive_failures += 1
                 if lt:
                     lt.record_ping(False)
-                # 5 consecutive failures during a finite analysis → device is
-                # offline, skip the rest. (∞ mode keeps probing — it's a monitor.)
-                if (not infinite and count > DISCOVERY_PING_COUNT
-                        and consecutive_failures >= ANALYSIS_MAX_CONSECUTIVE_FAILURES):
-                    remaining = count - (i + 1)
-                    if remaining > 0:
-                        dev.current_pings = count   # show as fully processed
-                        if lt:
-                            lt.record_skipped(remaining)
-                            lt.update_device(dev)
-                    break
+                # Too many consecutive misses → mark the device OFFLINE (threshold
+                # is configurable via 'offline_after_failed_pings'). In a finite
+                # analysis we then skip the rest; in ∞ mode we keep probing so the
+                # device can come back online (it's a live monitor).
+                threshold = lt.offline_after_failures if lt else ANALYSIS_MAX_CONSECUTIVE_FAILURES
+                if count > DISCOVERY_PING_COUNT and consecutive_failures >= threshold:
+                    dev.ping_status = False
+                    dev.is_offline = True
+                    if lt:
+                        lt.mark_offline(ip)
+                    if not infinite:
+                        remaining = count - (i + 1)
+                        if remaining > 0:
+                            dev.current_pings = count   # show as fully processed
+                            if lt:
+                                lt.record_skipped(remaining)
+                        break
 
             if lt:
                 lt.update_device(dev)
@@ -3542,13 +3639,15 @@ def scan_subnet(
     file_output: bool = True,
     interval_ms: int = PING_INTERVAL_MS,
     use_db: bool = True,
-    db_path: str = KNOWN_DEVICES_DB_FILE
+    db_path: str = KNOWN_DEVICES_DB_FILE,
+    offline_after_failures: int = ANALYSIS_MAX_CONSECUTIVE_FAILURES
 ) -> LiveTable:
     """Scan one or more subnets and ping all devices.
     `subnet` may be a single '/24' prefix string (e.g. '192.168.1') or a list
     of such prefixes; every host 1..255 in each subnet is scanned.
     ping_count == PING_COUNT_INFINITE keeps pinging until the scan is stopped."""
     live_table = live_table_obj if live_table_obj else LiveTable()
+    live_table.offline_after_failures = offline_after_failures
     subnets = [subnet] if isinstance(subnet, str) else list(subnet)
     ip_range = [f"{sn}.{i}" for sn in subnets
                 for i in range(SUBNET_FIRST_IP, SUBNET_LAST_IP + 1)]
@@ -3868,7 +3967,7 @@ def save_results_csv(live_table: LiveTable, output_dir: str = ".") -> str:
             writer = csv.writer(f)
             writer.writerow(CSV_COLUMNS)
             for d in devices:
-                if not d.ping_status and not d.from_db:
+                if not d.ping_status and not d.from_db and not d.seen:
                     continue
                 mac = d.mac_address if (d.mac_address and d.mac_address != UNKNOWN_VALUE) else ""
                 hostname = d.hostname if (d.hostname and d.hostname != UNKNOWN_VALUE) else ""
@@ -3989,6 +4088,10 @@ def main(ping_count: int = DEFAULT_PING_COUNT, high_pressure: bool = False) -> s
     fast_start = bool(fast_ip)
     if fast_start:
         live_table.set_network_info({'ip': fast_ip})
+        # Resolve our own MAC instantly + reliably via the IP Helper API (the own
+        # IP can't be ARP-resolved, and parsing ipconfig later is flaky), so the
+        # local row never shows 'Unknown'.
+        live_table.set_local_mac(get_local_mac_fast(fast_ip))
         # Resolve the gateway instantly too (IP Helper API) so recognised DB
         # devices are pre-loaded NOW and get pinged in the first discovery
         # sweep — not several seconds later when the slow query returns.
@@ -4085,7 +4188,9 @@ def main(ping_count: int = DEFAULT_PING_COUNT, high_pressure: bool = False) -> s
         file_output=cfg.get_bool('file_output', True, 'output'),
         interval_ms=cfg.get_int('ping_interval_ms', PING_INTERVAL_MS, 'scanning'),
         use_db=cfg_use_db,
-        db_path=db_path
+        db_path=db_path,
+        offline_after_failures=cfg.get_int('offline_after_failed_pings',
+                                           ANALYSIS_MAX_CONSECUTIVE_FAILURES, 'scanning')
     )
 
     control.shutdown = True

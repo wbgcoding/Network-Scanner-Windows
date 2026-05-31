@@ -37,6 +37,10 @@
 #   Stops fast LAN hosts from finishing instantly. Range: 0-10000 | Default: 100
 #ping_interval_ms = 100
 
+# offline_after_failed_pings  Mark a device OFFLINE after this many consecutive
+#   pings get no reply. Range: 1-100 | Default: 5
+#offline_after_failed_pings = 5
+
 # init_ping_count  Pings per device during the quick discovery sweep.
 #   Range: 1-100 | Default: 1
 #init_ping_count = 1

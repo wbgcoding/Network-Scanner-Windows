@@ -657,7 +657,7 @@ INFINITE_SYMBOL: str = "∞"
 DEFAULT_OUTPUT_DIR: str = "./Scans"
 
 # ── Known-Devices Database & CSV Export ──────────────────────────────────────
-KNOWN_DEVICES_DB_FILE: str = "known_devices.db"
+KNOWN_DEVICES_DB_FILE: str = "scanner.db"
 CSV_FILENAME_PREFIX: str = "network_scan_"
 TXT_FILENAME_PREFIX: str = "network_scan_"
 
@@ -816,14 +816,20 @@ class ConfigManager:
 
 
 def load_config_manager() -> ConfigManager:
-    """Singleton ConfigManager — prefers network_scanner.conf, falls back to config.ini."""
+    """Singleton ConfigManager.
+    Priority: network_scanner.conf → config.ini → network_scanner.conf.template
+    (template is always present because _ensure_conf_template writes it at startup).
+    This means a fresh install with no .conf still picks up all the documented
+    defaults (output_directory, ping_threads, …) from the template."""
     if not hasattr(load_config_manager, '_instance') or load_config_manager._instance is None:
         if os.path.isfile("network_scanner.conf"):
             path = "network_scanner.conf"
         elif os.path.isfile("config.ini"):
             path = "config.ini"
+        elif os.path.isfile("network_scanner.conf.template"):
+            path = "network_scanner.conf.template"
         else:
-            path = "network_scanner.conf"   # will silently use all defaults
+            path = "network_scanner.conf"   # all values will be Python defaults
         load_config_manager._instance = ConfigManager(path)
     return load_config_manager._instance
 
@@ -832,23 +838,23 @@ def load_config_manager() -> ConfigManager:
 # Single source of truth for network_scanner.conf.template. Everything is
 # commented out, so a fresh config runs entirely on the built-in defaults.
 _CONF_TEMPLATE_CONTENT = """\
-# ═══════════════════════════════════════════════════════════════════════════════
-# Network Scanner — configuration file
-# Copy this file to 'network_scanner.conf' and adjust the values.
-# Lines starting with # or ; are ignored. Out-of-range or invalid values are
-# corrected to the defaults shown below.
-# ═══════════════════════════════════════════════════════════════════════════════
+# ===============================================================================
+# Network Scanner -- configuration file
+# This file is used as-is when no network_scanner.conf exists.
+# Copy it to network_scanner.conf to customise your setup.
+# Lines starting with # or ; are ignored. Out-of-range values are auto-corrected.
+# ===============================================================================
 
-# ── THREADS ──────────────────────────────────────────────────────────────────
-# init_ping_threads  Threads used during the discovery phase. 0 = one per IP.
+# -- THREADS -------------------------------------------------------------------
+# init_ping_threads  Threads during discovery phase. 0 = one per IP.
 #   Range: 0-1000 | Default: 254
 #init_ping_threads = 254
 
-# ping_threads  Threads used during the analysis phase.
+# ping_threads  Threads during analysis phase.
 #   Range: 1-1000 | Default: 100
-#ping_threads = 100
+ping_threads = 100
 
-# ── PING ───────────────────────────────────────────────────────────────────────
+# -- PING ----------------------------------------------------------------------
 # init_ping_count  Pings per device during discovery.
 #   Range: 1-100 | Default: 1
 #init_ping_count = 1
@@ -857,19 +863,19 @@ _CONF_TEMPLATE_CONTENT = """\
 #   Range: 1-10000000 | Default: 10
 #ping_count = 10
 
-# ping_interval_ms  Pause between two pings to the SAME host, in milliseconds.
+# ping_interval_ms  Pause between two pings to the SAME host (ms).
 #   Keeps fast LAN hosts from racing to 100%. Range: 0-10000 | Default: 100
-#ping_interval_ms = 100
+ping_interval_ms = 100
 
 # refresh_rate  Minimum seconds between screen redraws.
 #   Range: 0.1-60.0 | Default: 1.0
 #refresh_rate = 1.0
 
-# console_font_size  Console font height in pixels forced on startup
-#   (0 = leave the console font untouched). Range: 0-72 | Default: 18
+# console_font_size  Console font height in pixels (0 = leave untouched).
+#   Range: 0-72 | Default: 18
 #console_font_size = 18
 
-# ── NETWORK ────────────────────────────────────────────────────────────────────
+# -- NETWORK -------------------------------------------------------------------
 # subnet  Target subnet in CIDR notation. Leave empty for auto-detection.
 #   Example: 192.168.1.0/24
 #subnet = 192.168.1.0/24
@@ -879,36 +885,35 @@ _CONF_TEMPLATE_CONTENT = """\
 #subnet_3 = 172.16.0.0/24
 #subnet_4 = 192.168.2.0/24
 
-# ── HIGH PRESSURE MODE ─────────────────────────────────────────────────────────
-# high_pressure_mode  Ping every device at once with several subthreads each.
+# -- HIGH PRESSURE MODE --------------------------------------------------------
+# high_pressure_mode  Ping all devices at once with several subthreads each.
 #   true  = maximum throughput (high CPU/network load)
 #   false = pipelined scan (discovery + analysis)  | Default: false
 #high_pressure_mode = false
 
-# ── OUTPUT ─────────────────────────────────────────────────────────────────────
+# -- OUTPUT --------------------------------------------------------------------
 # output_directory  Folder for scan results (created automatically).
 #   Default: ./Scans
 output_directory = ./Scans
 
 # file_output  Write a plain-text report after the scan.
 #   Default: true
-#file_output = true
+file_output = true
 
 # export_csv  Also write a machine-readable CSV file next to the report.
 #   Default: false
-#export_csv = false
+export_csv = false
 
-# ── KNOWN-DEVICES DATABASE ─────────────────────────────────────────────────────
-# known_devices_db  Remember devices per network (keyed by the gateway MAC) in a
-#   local SQLite file. When the same router is recognised again, its known
-#   devices are listed even while offline, and the database is updated each run.
-#   Default: true
-#known_devices_db = true
+# -- KNOWN-DEVICES DATABASE ----------------------------------------------------
+# known_devices_db  Store devices per network in scanner.db. The DB is updated
+#   after each scan and pre-loaded at startup so known devices appear offline
+#   immediately, switching to online as pings succeed. | Default: true
+known_devices_db = true
 
-# ── INTERNET PING ──────────────────────────────────────────────────────────────
+# -- INTERNET PING -------------------------------------------------------------
 # enable_internet_ping  Ping external hosts to measure internet latency.
 #   Default: true
-#enable_internet_ping = true
+enable_internet_ping = true
 
 # internet_hosts  Comma-separated list of IPv4 addresses.
 #   Default: 8.8.8.8, 8.8.4.4, 1.1.1.1, 9.9.9.9

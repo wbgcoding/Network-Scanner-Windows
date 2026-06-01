@@ -28,7 +28,8 @@ PURPLE = "#875fff"
 GRAY   = "#606060"
 AMBER  = "#e8a020"
 
-SVG_W  = 1140
+# Fit canvas exactly: left padding + 131 content chars + right padding
+SVG_W  = int(PAD_L * 2 + 131 * CW)   # = 1132
 
 def cx(col):
     return PAD_L + col * CW

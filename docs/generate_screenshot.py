@@ -1,302 +1,232 @@
+#!/usr/bin/env python3
 """
-Generate docs/screenshot.svg — a stylised Windows conhost terminal screenshot
-for the Network Scanner GitHub README.
+Generate docs/screenshot.svg by running the real LiveTable renderer with
+sample data. No actual network scanning — all IPs/MACs/hostnames are fake.
 """
-
-import os
+import sys, os, re, random
 import xml.etree.ElementTree as ET
 
-# Layout constants
-CW = 8.4
-LH = 19
-PAD_L = 16.0
-CHROME_H = 32
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
 
-# Canvas: symmetric left/right padding around 131 content chars
-SVG_W  = int(PAD_L * 2 + 131 * CW)   # = 1132
+# ── Patch terminal side-effects before import ─────────────────────────────────
+import network_scanner as ns
 
-# Colour palette
-BG     = "#0c0c0c"
-CHROME = "#1e1e1e"
-BORDER = "#3b78ff"
-DIM    = "#505050"
-NORM   = "#c8c8c8"
-BRIGHT = "#f2f2f2"
-CYAN   = "#61d6d6"
-GREEN  = "#16c60c"
-RED    = "#e74856"
-ORANGE = "#ff8700"
-LIME   = "#afff00"
-PURPLE = "#875fff"
-GRAY   = "#606060"
-AMBER  = "#e8a020"
+ns._resize_terminal          = lambda *a, **kw: (0, 0)
+ns._resize_terminal_windows  = lambda *a, **kw: (0, 0)
+ns._center_console_window    = lambda: None
+ns._enable_windows_ansi      = lambda: None
+ns._maximize_console         = lambda *a, **kw: None
 
-# Column start positions (char units, 0 = first char after left padding)
-# Layout (total 131 chars including ║ borders):
-#  ║  IP(15)  Status(9)  Hostname(20)  Vendor(20)  Avg(12)  Min(12)  Max(12)  Progress(12)  MAC(17)  ║
-#  0   1        16         25            45           65       77       89        101          113     130
-COL_IP       = 1
-COL_STATUS   = 16
-COL_HOSTNAME = 25
-COL_VENDOR   = 45
-COL_AVG      = 65
-COL_MIN      = 77
-COL_MAX      = 89
-COL_PROGRESS = 101
-COL_MAC      = 113
-COL_RIGHT    = 130   # right ║ border
+random.seed(12)   # stable spinner and title colour
 
-def cx(col):
-    return PAD_L + col * CW
+# ── ANSI colour helpers ───────────────────────────────────────────────────────
+_BASIC = {
+    30:'#0c0c0c', 31:'#c50f1f', 32:'#13a10e', 33:'#c19c00',
+    34:'#0037da', 35:'#881798', 36:'#3a96dd', 37:'#cccccc',
+    90:'#767676', 91:'#e74856', 92:'#16c60c', 93:'#f9f1a5',
+    94:'#3b78ff', 95:'#b4009e', 96:'#61d6d6', 97:'#f2f2f2',
+}
 
-def make_row(spans, row_index):
-    """Return a <text> element for one content row."""
-    y = CHROME_H + LH + row_index * LH
-    text = ET.Element("text", {
-        "y": str(y),
-        "xml:space": "preserve",
-        "font-family": "Consolas, 'Courier New', monospace",
-        "font-size": "14",
-        "dominant-baseline": "auto",
-    })
-    for span in spans:
-        col     = span[0]
-        content = span[1]
-        fill    = span[2]
-        bold    = len(span) > 3 and span[3]
-        ts = ET.SubElement(text, "tspan", {"x": f"{cx(col):.1f}", "fill": fill})
-        if bold:
-            ts.set("font-weight", "bold")
-        ts.text = content   # ElementTree auto-escapes &, <, >
-    return text
+def _256(n):
+    if n < 16:
+        return _BASIC.get(n + (90 if n >= 8 else 30), '#808080')
+    if n < 232:
+        n -= 16
+        b = n % 6; n //= 6; g = n % 6; r = n // 6
+        v = lambda x: 0 if x == 0 else 55 + x * 40
+        return f'#{v(r):02x}{v(g):02x}{v(b):02x}'
+    val = 8 + (n - 232) * 10
+    return f'#{val:02x}{val:02x}{val:02x}'
 
+def _dim(h):
+    r, g, b = int(h[1:3], 16), int(h[3:5], 16), int(h[5:7], 16)
+    return f'#{r//2:02x}{g//2:02x}{b//2:02x}'
 
-def device_row(ip, status, hostname, vendor, avg, mn, mx, done, total, color, mac="",
-               mark_high=False, mark_low=False):
-    """One device row with all columns filled."""
-    stat_color = GREEN if status == "ONLINE" else RED
-    progress   = f"{done}/{total}".center(11)
+# ── ANSI line parser ──────────────────────────────────────────────────────────
+# Matches any escape sequence: captures params + terminator letter
+_ALL_ESC = re.compile(r'\033\[([0-9;]*)([a-zA-Z])')
 
-    def fmt_ms(v):
-        return f"{v:.1f}ms".ljust(10) if v is not None else "   ─    "
+def _apply_sgr(codes_str, st):
+    codes = [int(x) for x in codes_str.split(';') if x] if codes_str else [0]
+    i = 0
+    while i < len(codes):
+        c = codes[i]
+        if   c == 0:  st['fg'] = '#c8c8c8'; st['bold'] = False; st['dim'] = False
+        elif c == 1:  st['bold'] = True
+        elif c == 2:  st['dim']  = True
+        elif c == 22: st['bold'] = False; st['dim'] = False
+        elif c in _BASIC: st['fg'] = _BASIC[c]; st['dim'] = False
+        elif c == 38 and i + 2 < len(codes) and codes[i+1] == 5:
+            st['fg'] = _256(codes[i + 2]); st['dim'] = False; i += 2
+        elif c == 39: st['fg'] = '#c8c8c8'
+        i += 1
 
-    spans = [
-        (0,            "║",                   BORDER),
-        (COL_IP,       ip[:14],               color),
-        (COL_STATUS,   status,                stat_color, True),
-        (COL_HOSTNAME, (hostname or "")[:19], color),
-        (COL_VENDOR,   vendor[:19],           NORM),
-    ]
+def parse_line(raw):
+    """Return list of (text, hex_color, bold) for one ANSI-encoded line."""
+    st = {'fg': '#c8c8c8', 'bold': False, 'dim': False}
+    result, pos = [], 0
+    for m in _ALL_ESC.finditer(raw):
+        txt = raw[pos:m.start()]
+        if txt:
+            c = _dim(st['fg']) if st['dim'] else st['fg']
+            result.append((txt, c, st['bold']))
+        if m.group(2) == 'm':        # SGR colour/style code
+            _apply_sgr(m.group(1), st)
+        # all other codes (cursor movement, erase…) are skipped
+        pos = m.end()
+    tail = raw[pos:]
+    if tail:
+        c = _dim(st['fg']) if st['dim'] else st['fg']
+        result.append((tail, c, st['bold']))
+    return result
 
-    # Optional high/low ping markers (1 char left of Avg column)
-    if mark_high and avg is not None:
-        spans.append((COL_AVG - 2, "█", RED))
-    if mark_low and avg is not None:
-        spans.append((COL_AVG - 2, "█", GREEN))
+# ── Sample data ───────────────────────────────────────────────────────────────
+SAMPLE_NET = {
+    'ip':          '192.168.1.100',
+    'subnet_mask': '255.255.255.0',
+    'gateway':     '192.168.1.1',
+    'dns_servers': ['192.168.1.1', '8.8.8.8'],
+    'mac':         'C4:A3:66:E1:2F:08',
+}
 
+#            ip               hostname         mac                avg   mn    mx   last  done tot gid  off
+SAMPLE_LAN = [
+    ('192.168.1.1',  'router.local',  'D4:21:22:A8:1F:01',  0.8,  0.7,  1.4,  0.9, 100,100, 1, False),
+    ('192.168.1.2',  'desktop-main',  'C4:A3:66:E1:2F:08',  0.4,  0.3,  0.9,  0.4, 100,100, 2, False),
+    ('192.168.1.5',  'laptop',        'A4:83:E7:2C:45:1F',  2.3,  1.8,  4.1,  2.1, 100,100, 3, False),
+    ('192.168.1.8',  'nas-storage',   '00:11:32:AB:CD:EF',  1.1,  0.9,  2.0,  1.0, 100,100, 4, False),
+    ('192.168.1.12', 'android-phone', 'A8:B5:E1:3D:8C:21',  4.8,  3.1,  9.2,  4.2,  86,100, 5, False),
+    ('192.168.1.20', 'smart-tv',      'CC:DA:8E:12:34:56', 18.4, 11.9, 31.2, 16.7,  72,100, 6, False),
+    ('192.168.1.31', 'raspi-01',      'DC:A6:32:7E:4B:2C',  2.9,  2.4,  4.7,  3.1,  68,100, 7, False),
+    ('192.168.1.35', '',              '70:4F:57:AA:BB:CC', None, None, None, None,    0,100, 8, True ),
+]
+
+SAMPLE_INET = [
+    ('8.8.8.8', 'dns.google',      None, 12.4, 11.8, 15.3, 12.1, 100, 100),
+    ('1.1.1.1', 'one.one.one.one', None,  9.8,  9.1, 12.6,  9.4, 100, 100),
+]
+
+# ── Build LiveTable with sample state ─────────────────────────────────────────
+lt = ns.LiveTable()
+lt.current_phase    = 'Analysis'
+lt.phase_number     = 2
+lt.pings_per_device = 100
+lt.active_threads   = 8
+lt.scanned_subnets  = ['192.168.1.0/24']
+lt.known_network    = True
+lt.is_infinite      = False
+
+lt.set_network_info(SAMPLE_NET)
+lt.local_ip   = SAMPLE_NET['ip']
+lt.local_mac  = SAMPLE_NET['mac']
+lt.gateway_ip = SAMPLE_NET['gateway']
+
+total_done = 0
+for ip, host, mac, avg, mn, mx, last, done, tot, gid, off in SAMPLE_LAN:
+    d = ns.Device(ip=ip)
+    d.hostname      = host or None
+    d.mac_address   = mac
+    d.ping_status   = not off
+    d.seen          = not off
+    d.current_pings = done
+    d.target_pings  = tot
+    d.is_offline    = off
+    d.from_db       = off   # offline devices loaded from DB stay visible
+    d.group_id      = gid
     if avg is not None:
-        spans += [
-            (COL_AVG, fmt_ms(avg), NORM),
-            (COL_MIN, fmt_ms(mn),  NORM),
-            (COL_MAX, fmt_ms(mx),  NORM),
-        ]
-    else:
-        spans += [
-            (COL_AVG, "   ─    ", DIM),
-            (COL_MIN, "   ─    ", DIM),
-            (COL_MAX, "   ─    ", DIM),
-        ]
+        d.ping_stats = {'avg': avg, 'min': mn, 'max': mx}
+        d.last_ping  = last
+    lt.update_device(d)
+    if off:
+        with lt.lock:
+            lt.devices[ip].from_db = True   # update_device doesn't copy from_db
+    total_done += done
 
-    spans.append((COL_PROGRESS, progress, BRIGHT if done > 0 else DIM, True))
+lt.total_count     = len(SAMPLE_LAN)
+lt.completed_count = sum(1 for *_, off in SAMPLE_LAN if not off)
 
-    if mac:
-        spans.append((COL_MAC, mac, DIM))
+for ip, host, mac, avg, mn, mx, last, done, tot in SAMPLE_INET:
+    lt.public_latencies[ip] = {'avg': avg, 'min': mn, 'max': mx, 'last': last, 'count': done}
+    total_done += done
 
-    spans.append((COL_RIGHT, "║", BORDER))
-    return spans
+lt.total_pings_target    = 100 * (len(SAMPLE_LAN) + len(SAMPLE_INET))
+lt.total_pings_completed = total_done
+lt.ping_success  = int(total_done * 0.96)
+lt.ping_failed   = int(total_done * 0.04)
+lt.ping_skipped  = 0
 
+# ── Intercept render output ───────────────────────────────────────────────────
+captured = []
 
-def build_svg():
-    rows = []
+def _capture(output, clear_first=False):
+    captured.extend(output)
 
-    # Separator helpers
-    def top_border():
-        # Extend slightly past SVG_W so no dark gap shows at the right edge
-        n = int((SVG_W - PAD_L) / CW) + 1
-        rows.append([(0, "═" * n, BORDER)])
+lt._write_frame = _capture
 
-    def thick_sep():
-        n = int((SVG_W - PAD_L) / CW) - 1
-        rows.append([(0, "╠", BORDER), (1, "═" * (n - 1), BORDER), (n, "╣", BORDER)])
+with lt.lock:
+    lt._render_internal_locked(clear_first=False)
 
-    def thin_sep():
-        n = int((SVG_W - PAD_L) / CW) - 1
-        rows.append([(0, "║", BORDER), (1, "─" * (n - 1), DIM), (n, "║", BORDER)])
+print(f"Captured {len(captured)} lines from LiveTable renderer")
 
-    # ── Top border ────────────────────────────────────────────────────────────
-    top_border()
+# ── ANSI lines → SVG ──────────────────────────────────────────────────────────
+CW     = 8.4      # Consolas 14 px character width
+LH     = 19       # line height
+PAD_L  = 16.0     # left padding
+CHR_H  = 32       # window chrome height
 
-    # ── Header: phase / title / subnet ────────────────────────────────────────
-    rows.append([
-        (0,   "║",             BORDER),
-        (2,   "⚡",             LIME,   True),
-        (4,   "2 – Analysis",  BRIGHT, True),
-        (17,  "(100 pings)",   NORM),
-        (46,  "Network Scanner", LIME, True),
-        (96,  "Subnets:",      CYAN),
-        (105, "192.168.1.0/24", BRIGHT, True),
-        (COL_RIGHT, "║",       BORDER),
-    ])
+SVG_W  = int(PAD_L * 2 + ns.TABLE_WIDTH * CW)
+SVG_H  = CHR_H + (len(captured) + 1) * LH + 8
 
-    # ── Threads ───────────────────────────────────────────────────────────────
-    rows.append([
-        (0,   "║",        BORDER),
-        (44,  "Threads:", CYAN),
-        (53,  "8",        BRIGHT, True),
-        (COL_RIGHT, "║",  BORDER),
-    ])
+svg = ET.Element('svg', {
+    'xmlns':   'http://www.w3.org/2000/svg',
+    'width':   str(SVG_W),
+    'height':  str(SVG_H),
+    'viewBox': f'0 0 {SVG_W} {SVG_H}',
+})
 
-    # ── Pings progress bar ────────────────────────────────────────────────────
-    rows.append([
-        (0,   "║",               BORDER),
-        (2,   "Pings",           CYAN),
-        (8,   "█" * 26,          GREEN),
-        (34,  "░" * 12,          DIM),
-        (47,  "68/100",          BRIGHT, True),
-        (57,  "IP:",             CYAN),
-        (61,  "192.168.1.100",   BRIGHT),
-        (79,  "MAC:",            CYAN),
-        (84,  "C4-A3-66-E1-2F-08", NORM),
-        (COL_RIGHT, "║",         BORDER),
-    ])
+# Background
+ET.SubElement(svg, 'rect', {'width': str(SVG_W), 'height': str(SVG_H), 'fill': '#0c0c0c'})
 
-    # ── Devices bar ───────────────────────────────────────────────────────────
-    rows.append([
-        (0,   "║",               BORDER),
-        (2,   "Devcs",           CYAN),
-        (8,   "█" * 38,          GREEN),
-        (47,  "9 / 9",           BRIGHT, True),
-        (57,  "GW:",             CYAN),
-        (61,  "192.168.1.1",     BRIGHT),
-        (79,  "DNS:",            CYAN),
-        (84,  "192.168.1.1, 8.8.8.8", NORM),
-        (COL_RIGHT, "║",         BORDER),
-    ])
+# Chrome bar
+ET.SubElement(svg, 'rect', {'width': str(SVG_W), 'height': str(CHR_H), 'fill': '#1e1e1e'})
+for bx, col in [(16, '#ff5f57'), (36, '#febc2e'), (56, '#28c840')]:
+    ET.SubElement(svg, 'circle', {'cx': str(bx), 'cy': '16', 'r': '6', 'fill': col})
+ttl = ET.SubElement(svg, 'text', {
+    'x': str(SVG_W // 2), 'y': '21', 'text-anchor': 'middle',
+    'fill': '#555', 'font-size': '13', 'font-family': 'sans-serif',
+})
+ttl.text = 'NetworkScanner.exe'
 
-    thick_sep()
-
-    # ── Column headers ────────────────────────────────────────────────────────
-    rows.append([
-        (0,            "║",          BORDER),
-        (COL_IP,       "IP",         DIM),
-        (COL_STATUS,   "Status",     DIM),
-        (COL_HOSTNAME, "Hostname",   DIM),
-        (COL_VENDOR,   "Vendor",     DIM),
-        (COL_AVG,      "Avg",        DIM),
-        (COL_MIN,      "Min",        DIM),
-        (COL_MAX,      "Max",        DIM),
-        (COL_PROGRESS, "Progress",   DIM),
-        (COL_MAC,      "MAC Address",DIM),
-        (COL_RIGHT,    "║",          BORDER),
-    ])
-
-    thick_sep()
-
-    # ── LAN device rows ───────────────────────────────────────────────────────
-    lan = [
-        # ip,              status,    hostname,       vendor,          avg,  mn,   mx,  done,tot, color,  mac
-        ("192.168.1.1",  "ONLINE",  "router.local",  "AVM GmbH",      0.8,  0.7,  1.4, 100, 100, CYAN,   "D4:21:22:A8:1F:01"),
-        ("192.168.1.2",  "ONLINE",  "desktop-main",  "Intel Corp.",    0.4,  0.3,  0.9, 100, 100, GREEN,  "C4:A3:66:E1:2F:08"),
-        ("192.168.1.5",  "ONLINE",  "laptop",        "Apple Inc.",     2.3,  1.8,  4.1, 100, 100, AMBER,  "A4:83:E7:2C:45:1F"),
-        ("192.168.1.8",  "ONLINE",  "nas-storage",   "Synology Inc.",  1.1,  0.9,  2.0, 100, 100, BORDER, "00:11:32:AB:CD:EF"),
-        ("192.168.1.12", "ONLINE",  "android-ph",    "Xiaomi Comm.",   4.8,  3.1,  9.2,  86, 100, PURPLE, "A8:B5:E1:3D:8C:21"),
-        ("192.168.1.20", "ONLINE",  "smart-tv",      "Samsung Elec.", 18.4, 11.9, 31.2,  72, 100, ORANGE, "CC:DA:8E:12:34:56"),
-        ("192.168.1.35", "OFFLINE", "",              "TP-Link Tech.", None, None, None,   0, 100, RED,    "70:4F:57:AA:BB:CC"),
-    ]
-
-    avgs = [d[4] for d in lan if d[4] is not None]
-    hi, lo = max(avgs), min(avgs)
-
-    for ip, status, hostname, vendor, avg, mn, mx, done, total, color, mac in lan:
-        rows.append(device_row(ip, status, hostname, vendor, avg, mn, mx, done, total,
-                               color, mac,
-                               mark_high=(avg == hi),
-                               mark_low=(avg == lo)))
-
-    thin_sep()
-
-    # ── Internet section ──────────────────────────────────────────────────────
-    n = int((SVG_W - PAD_L) / CW) - 3
-    rows.append([
-        (0, "║", BORDER),
-        (2, "─── Internet " + "─" * (n - 13), DIM),
-        (COL_RIGHT, "║", BORDER),
-    ])
-
-    inet = [
-        ("8.8.8.8", "ONLINE", "dns.google",      "Google LLC",  12.4, 11.8, 15.3, 100, 100, GREEN, ""),
-        ("1.1.1.1", "ONLINE", "one.one.one.one",  "Cloudflare",   9.8,  9.1, 12.6, 100, 100, CYAN,  ""),
-    ]
-    for ip, status, hostname, vendor, avg, mn, mx, done, total, color, mac in inet:
-        rows.append(device_row(ip, status, hostname, vendor, avg, mn, mx, done, total, color, mac))
-
-    # ── Bottom border ─────────────────────────────────────────────────────────
-    top_border()
-
-    # ── Footer controls ───────────────────────────────────────────────────────
-    rows.append([
-        (2,  "[P]",       BORDER, True),
-        (6,  "Pause",     NORM),
-        (14, "[Q]",       BORDER, True),
-        (18, "Stop & save", NORM),
-        (32, "[+/-]",     BORDER, True),
-        (38, "Timeout:",  NORM),
-        (47, "100ms",     BRIGHT, True),
-        (55, "[ESC]",     BORDER, True),
-        (61, "Quit",      NORM),
-    ])
-
-    # ── Build SVG ─────────────────────────────────────────────────────────────
-    num_rows = len(rows)
-    svg_h    = int(CHROME_H + (num_rows + 1.5) * LH)
-
-    svg = ET.Element("svg", {
-        "xmlns":   "http://www.w3.org/2000/svg",
-        "width":   str(SVG_W),
-        "height":  str(svg_h),
-        "viewBox": f"0 0 {SVG_W} {svg_h}",
+# One <text> row per captured line
+for ri, raw in enumerate(captured):
+    y    = CHR_H + LH + ri * LH
+    segs = parse_line(raw)
+    if not segs:
+        continue
+    row = ET.SubElement(svg, 'text', {
+        'y': str(y), 'xml:space': 'preserve',
+        'font-family': "Consolas,'Courier New',monospace",
+        'font-size': '14', 'dominant-baseline': 'auto',
     })
+    char_pos = 0
+    for text, color, bold in segs:
+        if not text:
+            continue
+        ts = ET.SubElement(row, 'tspan', {
+            'x': f'{PAD_L + char_pos * CW:.1f}', 'fill': color,
+        })
+        if bold:
+            ts.set('font-weight', 'bold')
+        ts.text = text
+        char_pos += len(text)
 
-    ET.SubElement(svg, "rect", {"width": str(SVG_W), "height": str(svg_h), "fill": BG})
-    ET.SubElement(svg, "rect", {"width": str(SVG_W), "height": str(CHROME_H), "fill": CHROME})
+# ── Write file ────────────────────────────────────────────────────────────────
+out = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'screenshot.svg')
+with open(out, 'w', encoding='utf-8') as f:
+    f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
+    f.write(ET.tostring(svg, encoding='unicode'))
 
-    for bx, col in [(16, "#ff5f57"), (36, "#febc2e"), (56, "#28c840")]:
-        ET.SubElement(svg, "circle", {"cx": str(bx), "cy": "16", "r": "6", "fill": col})
-
-    title_el = ET.SubElement(svg, "text", {
-        "x": str(SVG_W // 2), "y": "21",
-        "text-anchor": "middle",
-        "fill": "#555555", "font-size": "13", "font-family": "sans-serif",
-    })
-    title_el.text = "NetworkScanner.exe"
-
-    for i, spans in enumerate(rows):
-        svg.append(make_row(spans, i))
-
-    return ET.tostring(svg, encoding="unicode", xml_declaration=False)
-
-
-def main():
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    out_path   = os.path.join(script_dir, "screenshot.svg")
-    content    = '<?xml version="1.0" encoding="UTF-8"?>\n' + build_svg()
-
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(content)
-
-    print(f"Written: {out_path}")
-    print(f"Size:    {os.path.getsize(out_path):,} bytes")
-
-
-if __name__ == "__main__":
-    main()
+print(f"Written:  {out}")
+print(f"Size:     {os.path.getsize(out):,} bytes")
+print(f"SVG size: {SVG_W} x {SVG_H} px")

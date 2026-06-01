@@ -63,7 +63,9 @@ def _apply_sgr(codes_str, st):
         i += 1
 
 def parse_line(raw):
-    """Return list of (text, hex_color, bold) for one ANSI-encoded line."""
+    """Return list of (text, hex_color, bold) for one ANSI-encoded line.
+    Adjacent segments with identical color+bold are merged so runs of block
+    characters become a single tspan (prevents inter-character gaps in SVG)."""
     st = {'fg': '#c8c8c8', 'bold': False, 'dim': False}
     result, pos = [], 0
     for m in _ALL_ESC.finditer(raw):
@@ -71,15 +73,21 @@ def parse_line(raw):
         if txt:
             c = _dim(st['fg']) if st['dim'] else st['fg']
             result.append((txt, c, st['bold']))
-        if m.group(2) == 'm':        # SGR colour/style code
+        if m.group(2) == 'm':
             _apply_sgr(m.group(1), st)
-        # all other codes (cursor movement, erase…) are skipped
         pos = m.end()
     tail = raw[pos:]
     if tail:
         c = _dim(st['fg']) if st['dim'] else st['fg']
         result.append((tail, c, st['bold']))
-    return result
+    # Merge consecutive segments with same color and bold
+    merged = []
+    for txt, col, bold in result:
+        if merged and merged[-1][1] == col and merged[-1][2] == bold:
+            merged[-1] = (merged[-1][0] + txt, col, bold)
+        else:
+            merged.append((txt, col, bold))
+    return merged
 
 # ── Sample data ───────────────────────────────────────────────────────────────
 SAMPLE_NET = {

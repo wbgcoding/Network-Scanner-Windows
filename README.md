@@ -4,8 +4,6 @@ A terminal network scanner for Windows. Run it on your LAN and it pings every ho
 
 ![Network Scanner running a scan](docs/screenshot.svg)
 
-*(Sample data — private IPs and made-up MACs.)*
-
 ---
 
 ## What it does

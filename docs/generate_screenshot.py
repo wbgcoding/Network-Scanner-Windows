@@ -92,14 +92,14 @@ SAMPLE_NET = {
 
 #            ip               hostname         mac                avg   mn    mx   last  done tot gid  off
 SAMPLE_LAN = [
-    ('192.168.1.1',  'router.local',  'D4:21:22:A8:1F:01',  0.8,  0.7,  1.4,  0.9, 100,100, 1, False),
-    ('192.168.1.2',  'desktop-main',  'C4:A3:66:E1:2F:08',  0.4,  0.3,  0.9,  0.4, 100,100, 2, False),
-    ('192.168.1.5',  'laptop',        'A4:83:E7:2C:45:1F',  2.3,  1.8,  4.1,  2.1, 100,100, 3, False),
-    ('192.168.1.8',  'nas-storage',   '00:11:32:AB:CD:EF',  1.1,  0.9,  2.0,  1.0, 100,100, 4, False),
-    ('192.168.1.12', 'android-phone', 'A8:B5:E1:3D:8C:21',  4.8,  3.1,  9.2,  4.2,  86,100, 5, False),
-    ('192.168.1.20', 'smart-tv',      'CC:DA:8E:12:34:56', 18.4, 11.9, 31.2, 16.7,  72,100, 6, False),
-    ('192.168.1.31', 'raspi-01',      'DC:A6:32:7E:4B:2C',  2.9,  2.4,  4.7,  3.1,  68,100, 7, False),
-    ('192.168.1.35', '',              '70:4F:57:AA:BB:CC', None, None, None, None,    0,100, 8, True ),
+    ('192.168.1.1',  'router.local',  '12:34:56:78:90:01',  0.8,  0.7,  1.4,  0.9, 100,100, 1, False),
+    ('192.168.1.2',  'desktop-main',  '12:34:56:78:90:02',  0.4,  0.3,  0.9,  0.4, 100,100, 2, False),
+    ('192.168.1.5',  'laptop',        '12:34:56:78:90:03',  2.3,  1.8,  4.1,  2.1, 100,100, 3, False),
+    ('192.168.1.8',  'nas-storage',   '12:34:56:78:90:04',  1.1,  0.9,  2.0,  1.0, 100,100, 4, False),
+    ('192.168.1.12', 'android-phone', '12:34:56:78:90:05',  4.8,  3.1,  9.2,  4.2,  86,100, 5, False),
+    ('192.168.1.20', 'smart-tv',      '12:34:56:78:90:06', 18.4, 11.9, 31.2, 16.7,  72,100, 6, False),
+    ('192.168.1.31', 'raspi-01',      '12:34:56:78:90:07',  2.9,  2.4,  4.7,  3.1,  68,100, 7, False),
+    ('192.168.1.35', '',              '12:34:56:78:90:08', None, None, None, None,    0,100, 8, True ),
 ]
 
 SAMPLE_INET = [
@@ -175,7 +175,7 @@ LH     = 19       # line height
 PAD_L  = 16.0     # left padding
 CHR_H  = 32       # window chrome height
 
-SVG_W  = int(PAD_L * 2 + ns.TABLE_WIDTH * CW)
+SVG_W  = int(PAD_L + ns.TABLE_WIDTH * CW) + 1   # canvas ends at table edge
 SVG_H  = CHR_H + (len(captured) + 1) * LH + 8
 
 svg = ET.Element('svg', {

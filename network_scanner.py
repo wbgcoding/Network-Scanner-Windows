@@ -117,6 +117,58 @@ def _ensure_classic_console() -> None:
         sys.exit(0)
 
 
+_ICON_FILENAME = "network.ico"
+
+
+def _set_console_window_icon() -> None:
+    """Point the live console window's icon (title bar, Alt-Tab, taskbar) at the
+    app's network icon. A console app runs under conhost.exe, whose generic icon
+    would otherwise show even though the .exe file itself carries the icon.
+    Windows only; best-effort."""
+    if platform.system() != "Windows":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if not hwnd:
+            return
+        # The frozen .exe carries the icon as a resource; in source mode load the
+        # bundled network.ico next to the script.
+        if getattr(sys, "frozen", False):
+            icon_src = sys.executable
+        else:
+            cand = os.path.join(os.path.dirname(os.path.abspath(__file__)), _ICON_FILENAME)
+            icon_src = cand if os.path.isfile(cand) else None
+        if not icon_src:
+            return
+        big, small = ctypes.c_void_p(), ctypes.c_void_p()
+        if ctypes.windll.shell32.ExtractIconExW(
+                ctypes.c_wchar_p(icon_src), 0,
+                ctypes.byref(big), ctypes.byref(small), 1) <= 0:
+            return
+        WM_SETICON, ICON_SMALL, ICON_BIG = 0x0080, 0, 1
+        send = ctypes.windll.user32.SendMessageW
+        send.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        send.restype = wintypes.LPARAM
+        if big.value:
+            send(hwnd, WM_SETICON, ICON_BIG, big.value)
+        if small.value:
+            send(hwnd, WM_SETICON, ICON_SMALL, small.value)
+        # Also set the window-class icons so the taskbar button uses ours.
+        GCLP_HICON, GCLP_HICONSM = -14, -34
+        setclass = getattr(ctypes.windll.user32, "SetClassLongPtrW", None) \
+            or ctypes.windll.user32.SetClassLongW
+        setclass.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+        setclass.restype = ctypes.c_void_p
+        if big.value:
+            setclass(hwnd, GCLP_HICON, big.value)
+        if small.value:
+            setclass(hwnd, GCLP_HICONSM, small.value)
+    except Exception:
+        pass
+
+
 def _enable_windows_ansi() -> None:
     """Enable VT100/ANSI escape processing in the Windows console.
     Uses CONOUT$ so it works even when sys.stdout is redirected."""
@@ -4132,6 +4184,7 @@ def main(ping_count: int = DEFAULT_PING_COUNT, high_pressure: bool = False) -> s
     # out of font handling.
     font_max_height = cfg.get_int('console_font_size', CONSOLE_FONT_HEIGHT, 'display')
     _maximize_console(TABLE_WIDTH, font_max_height)
+    _set_console_window_icon()   # show the network icon on the conhost window too
 
     cfg_ping_count = cfg.get_int('ping_count', DEFAULT_PING_COUNT, 'scanning')
     if ping_count == DEFAULT_PING_COUNT and cfg_ping_count != DEFAULT_PING_COUNT:

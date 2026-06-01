@@ -95,6 +95,20 @@ def _conhost_relaunch_command() -> List[str]:
     return ["conhost.exe"] + inner
 
 
+def _remove_zone_identifier() -> None:
+    """Delete the Zone.Identifier ADS that Windows attaches to files downloaded
+    from the internet (Mark of the Web, ZoneId=3). Its presence triggers the
+    SmartScreen 'unknown publisher' dialog every time the exe is launched. Removing
+    it once means the warning never appears again after the first 'Run anyway'.
+    Only applies to the frozen .exe; a no-op for source runs and non-Windows."""
+    if platform.system() != "Windows" or not getattr(sys, "frozen", False):
+        return
+    try:
+        ctypes.windll.kernel32.DeleteFileW(sys.executable + ":Zone.Identifier")
+    except Exception:
+        pass
+
+
 def _ensure_classic_console() -> None:
     """Re-host under conhost.exe when launched in Windows Terminal, which ignores
     the window-resize/font calls the scanner needs. Relaunches once and exits;
@@ -4172,6 +4186,7 @@ def _hard_clear() -> None:
 
 def main(ping_count: int = DEFAULT_PING_COUNT, high_pressure: bool = False) -> str:
     """Run a network scan."""
+    _remove_zone_identifier()  # delete MOTW ADS so SmartScreen skips future runs
     _ensure_classic_console()  # re-host under conhost (Win Terminal can't resize)
     _init_console_encoding()   # UTF-8 stdout BEFORE any glyphs are written
     _ensure_conf_template()

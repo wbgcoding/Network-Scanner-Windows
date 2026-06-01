@@ -63,11 +63,8 @@ def ping_bar(done, total, filled_color, empty_color, bar_len=10):
 
 def device_row(idx, ip, status, hostname, vendor, avg, mn, mx, done, total, color):
     """Build the list of spans for a device row."""
-    bar_filled = round(10 * done / total) if total else 0
-    bar_str_on  = "█" * bar_filled
-    bar_str_off = "░" * (10 - bar_filled)
-    bar_color   = GREEN if status == "ONLINE" else GRAY
-    stat_color  = GREEN if status == "ONLINE" else RED
+    stat_color = GREEN if status == "ONLINE" else RED
+    progress   = f"{done}/{total}".center(11)
 
     def fmt_ms(v):
         return f"{v:.1f}ms".ljust(9) if v is not None else "   ─   "
@@ -90,11 +87,7 @@ def device_row(idx, ip, status, hostname, vendor, avg, mn, mx, done, total, colo
         spans.append((88, "   ─   ", DIM))
         spans.append((100, "   ─   ", DIM))
 
-    spans += [
-        (112, bar_str_on,              bar_color),
-        (112 + bar_filled, bar_str_off, DIM),
-        (123, f" {done}/{total}",       BRIGHT, True),
-    ]
+    spans.append((112, progress, BRIGHT if done > 0 else DIM, True))
     spans.append((130, "║", BORDER))
     return spans
 
@@ -104,9 +97,9 @@ def device_row_with_markers(idx, ip, status, hostname, vendor, avg, mn, mx, done
     spans = device_row(idx, ip, status, hostname, vendor, avg, mn, mx, done, total, color)
 
     if mark_high and avg is not None:
-        spans.append((74, "█ ", RED))
+        spans.append((74, "█", RED))
     if mark_low and avg is not None:
-        spans.append((74, "█ ", GREEN))
+        spans.append((74, "█", GREEN))
 
     return spans
 

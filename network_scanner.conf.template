@@ -99,6 +99,11 @@
 # refresh_rate  Minimum seconds between screen redraws. Range: 0.1-60.0 | Default: 1.0
 #refresh_rate = 1.0
 
-# console_font_size  Console font height in pixels (0 = leave the font untouched).
-#   Range: 0-72 | Default: 18
+# console_font_size  Console font height used when the window is sized at startup.
+#   The scanner picks the largest value that still fits the full table on screen,
+#   so on most machines you never need to touch this. If the table wraps or is cut
+#   off (common on screens below 1920x1080 or with Windows DPI scaling above 100%),
+#   lower this value — try 10 or 8. Set to 0 to disable all automatic font and
+#   window sizing entirely.
+#   Range: 0-18 | Default: 18
 #console_font_size = 18

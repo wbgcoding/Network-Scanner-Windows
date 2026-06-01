@@ -47,7 +47,7 @@ else:
 CONSOLE_FONT_HEIGHT: int = 18
 # Never shrink the font below this (keeps text readable on small screens; we
 # accept a capped window rather than an unreadable font).
-CONSOLE_FONT_MIN_HEIGHT: int = 12
+CONSOLE_FONT_MIN_HEIGHT: int = 8
 
 
 def _run(args, timeout: int = None) -> subprocess.CompletedProcess:

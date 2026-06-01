@@ -31,6 +31,20 @@ as results come in.
 
 No admin rights required: latency is measured through the Windows IP Helper API.
 
+## Running the .exe
+
+Windows may show a "Windows protected your PC" SmartScreen warning the first time
+you run a downloaded `.exe`. This happens because the file isn't code-signed.
+
+To get past it:
+
+1. Click **More info** in the dialog, then click **Run anyway** — or —
+2. Right-click the `.exe` → **Properties** → tick **Unblock** at the bottom → OK,
+   then double-click to run normally.
+
+The scanner doesn't connect to the internet, phone home, or write anything outside
+its own folder.
+
 ## Quick start
 
 Run from source:
@@ -96,7 +110,7 @@ or scripts.
 ## Known-devices database
 
 With `known_devices_db = true` the scanner keeps a small SQLite file
-(`known_devices.db`) keyed by the gateway's MAC address. Every device it finds on a
+(`scanner.db`) keyed by the gateway's MAC address. Every device it finds on a
 network is saved there. The next time it sees the same router, the devices it knows
 about are listed too — even the ones that didn't answer this time — so you can spot
 what's missing. The database is updated on every run.
@@ -113,6 +127,22 @@ This builds a single standalone `dist\NetworkScanner.exe` with PyInstaller. The
 config, the known-devices database and the Scans folder are created next to the
 `.exe` at runtime and stay as separate files so you can edit them without
 rebuilding.
+
+## Display on small screens
+
+The scanner auto-fits its console window to the table width (131 columns). On
+screens with a resolution below 1920×1080 or with Windows DPI scaling above 100 %,
+the window may not fit fully or the font may be smaller than expected. If the table
+wraps or looks off, add this to your `network_scanner.conf`:
+
+```
+[display]
+console_font_size = 10
+```
+
+Values between 8 and 18 are accepted; lower values use a smaller font so the full
+table fits on smaller screens. Set to `0` to disable all automatic font / window
+sizing entirely.
 
 ## Notes
 

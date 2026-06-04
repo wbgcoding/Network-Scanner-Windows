@@ -105,5 +105,5 @@
 #   off (common on screens below 1920x1080 or with Windows DPI scaling above 100%),
 #   lower this value — try 10 or 8. Set to 0 to disable all automatic font and
 #   window sizing entirely.
-#   Range: 0-18 | Default: 18
+#   Range: 0-72 | Default: 18
 #console_font_size = 18

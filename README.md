@@ -2,7 +2,7 @@
 
 A terminal network scanner for Windows. Run it on your LAN and it pings every host in the subnet, then keeps pinging the ones that answer to track latency — min, max, average and the last sample — in a live table.
 
-![Network Scanner running a scan](docs/screenshot.svg)
+![Network Scanner running a scan](Beispiel.png)
 
 ---
 

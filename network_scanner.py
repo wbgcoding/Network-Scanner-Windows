@@ -18,6 +18,37 @@ from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime
 
+# Windows console ctypes structures shared across terminal utility functions
+if platform.system() == "Windows":
+    from ctypes import wintypes as _wintypes
+
+    class _COORD(ctypes.Structure):
+        _fields_ = [("X", _wintypes.SHORT), ("Y", _wintypes.SHORT)]
+
+    class _SMALL_RECT(ctypes.Structure):
+        _fields_ = [
+            ("Left",   _wintypes.SHORT), ("Top",    _wintypes.SHORT),
+            ("Right",  _wintypes.SHORT), ("Bottom", _wintypes.SHORT),
+        ]
+
+    class _CSBI(ctypes.Structure):
+        _fields_ = [
+            ("dwSize",              _COORD),
+            ("dwCursorPosition",    _COORD),
+            ("wAttributes",         _wintypes.WORD),
+            ("srWindow",            _SMALL_RECT),
+            ("dwMaximumWindowSize", _COORD),
+        ]
+
+    class _IP_ADDR_STRING(ctypes.Structure):
+        pass
+    _IP_ADDR_STRING._fields_ = [
+        ("Next",      ctypes.POINTER(_IP_ADDR_STRING)),
+        ("IpAddress", ctypes.c_char * 16),
+        ("IpMask",    ctypes.c_char * 16),
+        ("Context",   _wintypes.DWORD),
+    ]
+
 # ── Terminal Module Imports ──────────────────────────────────────────────────
 if platform.system() == "Windows":
     termios = None
@@ -272,26 +303,6 @@ def _console_max_cols() -> int:
     if platform.system() != "Windows":
         return 0
     try:
-        from ctypes import wintypes
-
-        class _COORD(ctypes.Structure):
-            _fields_ = [("X", wintypes.SHORT), ("Y", wintypes.SHORT)]
-
-        class _SMALL_RECT(ctypes.Structure):
-            _fields_ = [
-                ("Left",  wintypes.SHORT), ("Top",    wintypes.SHORT),
-                ("Right", wintypes.SHORT), ("Bottom", wintypes.SHORT),
-            ]
-
-        class _CSBI(ctypes.Structure):
-            _fields_ = [
-                ("dwSize",              _COORD),
-                ("dwCursorPosition",    _COORD),
-                ("wAttributes",         wintypes.WORD),
-                ("srWindow",            _SMALL_RECT),
-                ("dwMaximumWindowSize", _COORD),
-            ]
-
         kernel32 = ctypes.windll.kernel32
         handle = _open_conout()
         if not handle:
@@ -332,27 +343,6 @@ def _resize_terminal_windows(cols: int, rows: int = 0) -> Tuple[int, int]:
     rows=0 → maximum height that fits the screen.
     Returns (actual_cols, actual_rows) after resize, or (0, 0) on failure."""
     try:
-        import ctypes
-        from ctypes import wintypes
-
-        class _COORD(ctypes.Structure):
-            _fields_ = [("X", wintypes.SHORT), ("Y", wintypes.SHORT)]
-
-        class _SMALL_RECT(ctypes.Structure):
-            _fields_ = [
-                ("Left",   wintypes.SHORT), ("Top",    wintypes.SHORT),
-                ("Right",  wintypes.SHORT), ("Bottom", wintypes.SHORT),
-            ]
-
-        class _CSBI(ctypes.Structure):
-            _fields_ = [
-                ("dwSize",              _COORD),
-                ("dwCursorPosition",    _COORD),
-                ("wAttributes",         wintypes.WORD),
-                ("srWindow",            _SMALL_RECT),
-                ("dwMaximumWindowSize", _COORD),
-            ]
-
         kernel32 = ctypes.windll.kernel32
         handle = _open_conout()
         if not handle:
@@ -404,21 +394,6 @@ def _console_window_metrics() -> Tuple[int, int]:
     if platform.system() != "Windows":
         return (0, 0)
     try:
-        import ctypes
-        from ctypes import wintypes
-
-        class _COORD(ctypes.Structure):
-            _fields_ = [("X", wintypes.SHORT), ("Y", wintypes.SHORT)]
-
-        class _SMALL_RECT(ctypes.Structure):
-            _fields_ = [("Left", wintypes.SHORT), ("Top", wintypes.SHORT),
-                        ("Right", wintypes.SHORT), ("Bottom", wintypes.SHORT)]
-
-        class _CSBI(ctypes.Structure):
-            _fields_ = [("dwSize", _COORD), ("dwCursorPosition", _COORD),
-                        ("wAttributes", wintypes.WORD), ("srWindow", _SMALL_RECT),
-                        ("dwMaximumWindowSize", _COORD)]
-
         handle = _open_conout()
         if not handle:
             return (0, 0)
@@ -1507,35 +1482,23 @@ def _query_local_adapter(local_ip: str):
     if platform.system() != "Windows" or not local_ip:
         return (None, None)
     try:
-        import ctypes
-        from ctypes import wintypes
-
-        class _IP_ADDR_STRING(ctypes.Structure):
-            pass
-        _IP_ADDR_STRING._fields_ = [
-            ("Next", ctypes.POINTER(_IP_ADDR_STRING)),
-            ("IpAddress", ctypes.c_char * 16),
-            ("IpMask", ctypes.c_char * 16),
-            ("Context", wintypes.DWORD),
-        ]
-
         class _IP_ADAPTER_INFO(ctypes.Structure):
             pass
         _IP_ADAPTER_INFO._fields_ = [
             ("Next", ctypes.POINTER(_IP_ADAPTER_INFO)),
-            ("ComboIndex", wintypes.DWORD),
+            ("ComboIndex", _wintypes.DWORD),
             ("AdapterName", ctypes.c_char * 260),
             ("Description", ctypes.c_char * 132),
-            ("AddressLength", wintypes.UINT),
+            ("AddressLength", _wintypes.UINT),
             ("Address", ctypes.c_ubyte * 8),
-            ("Index", wintypes.DWORD),
-            ("Type", wintypes.UINT),
-            ("DhcpEnabled", wintypes.UINT),
+            ("Index", _wintypes.DWORD),
+            ("Type", _wintypes.UINT),
+            ("DhcpEnabled", _wintypes.UINT),
             ("CurrentIpAddress", ctypes.POINTER(_IP_ADDR_STRING)),
             ("IpAddressList", _IP_ADDR_STRING),
             ("GatewayList", _IP_ADDR_STRING),
             ("DhcpServer", _IP_ADDR_STRING),
-            ("HaveWins", wintypes.BOOL),
+            ("HaveWins", _wintypes.BOOL),
             ("PrimaryWinsServer", _IP_ADDR_STRING),
             ("SecondaryWinsServer", _IP_ADDR_STRING),
             ("LeaseObtained", ctypes.c_long),
@@ -1543,7 +1506,7 @@ def _query_local_adapter(local_ip: str):
         ]
 
         get_info = ctypes.windll.iphlpapi.GetAdaptersInfo
-        size = wintypes.ULONG(0)
+        size = _wintypes.ULONG(0)
         get_info(None, ctypes.byref(size))           # query required buffer size
         if size.value == 0:
             return (None, None)
@@ -1585,33 +1548,21 @@ def get_dns_servers_fast() -> List[str]:
     if platform.system() != "Windows":
         return []
     try:
-        import ctypes
-        from ctypes import wintypes
-
-        class _IP_ADDR_STRING(ctypes.Structure):
-            pass
-        _IP_ADDR_STRING._fields_ = [
-            ("Next", ctypes.POINTER(_IP_ADDR_STRING)),
-            ("IpAddress", ctypes.c_char * 16),
-            ("IpMask", ctypes.c_char * 16),
-            ("Context", wintypes.DWORD),
-        ]
-
         class _FIXED_INFO(ctypes.Structure):
             _fields_ = [
                 ("HostName", ctypes.c_char * 132),
                 ("DomainName", ctypes.c_char * 132),
                 ("CurrentDnsServer", ctypes.POINTER(_IP_ADDR_STRING)),
                 ("DnsServerList", _IP_ADDR_STRING),
-                ("NodeType", wintypes.UINT),
+                ("NodeType", _wintypes.UINT),
                 ("ScopeId", ctypes.c_char * 260),
-                ("EnableRouting", wintypes.UINT),
-                ("EnableProxy", wintypes.UINT),
-                ("EnableDns", wintypes.UINT),
+                ("EnableRouting", _wintypes.UINT),
+                ("EnableProxy", _wintypes.UINT),
+                ("EnableDns", _wintypes.UINT),
             ]
 
         get_params = ctypes.windll.iphlpapi.GetNetworkParams
-        size = wintypes.ULONG(0)
+        size = _wintypes.ULONG(0)
         get_params(None, ctypes.byref(size))
         if size.value == 0:
             return []

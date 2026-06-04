@@ -524,6 +524,10 @@ def _maximize_console(content_cols: int, font_max_height: int) -> None:
     if not _console_font_fitted:
         _fit_console_font(content_cols + CONSOLE_FONT_FIT_MARGIN, max_height=font_max_height)
         _console_font_fitted = True
+        # SetCurrentConsoleFontEx is not immediately reflected in dwMaximumWindowSize.Y;
+        # a first resize commits the new font to the window so the second call reads
+        # the correct full-screen row count for that font.
+        _resize_terminal(content_cols + CONSOLE_BORDER_MARGIN, rows=0)
     _resize_terminal(content_cols + CONSOLE_BORDER_MARGIN, rows=0)
     _center_console_window()
 

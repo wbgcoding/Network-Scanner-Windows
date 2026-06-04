@@ -8,7 +8,7 @@ Pings every host on your `/24` subnet and tracks live latency — min, max, aver
 
 ## Download
 
-Grab `NetworkScanner-v1.5.2.zip` from the [releases page](https://github.com/wbgcoding/Network-Scanner/releases/latest), unzip it, run `NetworkScanner.exe`.
+Download the latest zip from the [releases page](https://github.com/wbgcoding/Network-Scanner/releases/latest), unzip it, run `NetworkScanner.exe`.
 
 First launch may trigger a SmartScreen prompt ("Windows protected your PC"). Click **More info → Run anyway**. The app removes the download flag on startup, so it only appears once.
 

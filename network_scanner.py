@@ -18,6 +18,12 @@ from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime
 
+# ── Windows console font constants ───────────────────────────────────────────
+_CONSOLE_FONT_FAMILY: int = 54   # FF_DONTCARE | TMPF_TRUETYPE
+_CONSOLE_FONT_WEIGHT: int = 400  # FW_NORMAL
+_ENABLE_VT_PROCESSING: int = 0x0004   # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+_CP_UTF8: int = 65001
+
 # Windows console ctypes structures shared across terminal utility functions
 if platform.system() == "Windows":
     from ctypes import wintypes as _wintypes
@@ -227,7 +233,7 @@ def _enable_windows_ansi() -> None:
             mode = ctypes.c_ulong(0)
             if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
                 # ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING
-                kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+                kernel32.SetConsoleMode(handle, mode.value | _ENABLE_VT_PROCESSING)
         finally:
             kernel32.CloseHandle(handle)
     except Exception:
@@ -241,8 +247,8 @@ def _init_console_encoding() -> None:
     if platform.system() == "Windows":
         try:
             kernel32 = ctypes.windll.kernel32
-            kernel32.SetConsoleOutputCP(65001)  # CP_UTF8 — console interprets bytes as UTF-8
-            kernel32.SetConsoleCP(65001)
+            kernel32.SetConsoleOutputCP(_CP_UTF8)
+            kernel32.SetConsoleCP(_CP_UTF8)
         except Exception:
             pass
     for stream in (sys.stdout, sys.stderr):
@@ -259,20 +265,14 @@ def _normalize_console_font(height: int = CONSOLE_FONT_HEIGHT) -> bool:
     if platform.system() != "Windows" or height <= 0:
         return False
     try:
-        import ctypes
-        from ctypes import wintypes
-
-        class _COORD(ctypes.Structure):
-            _fields_ = [("X", wintypes.SHORT), ("Y", wintypes.SHORT)]
-
         class _CONSOLE_FONT_INFOEX(ctypes.Structure):
             _fields_ = [
-                ("cbSize",     wintypes.ULONG),
-                ("nFont",      wintypes.DWORD),
+                ("cbSize",     _wintypes.ULONG),
+                ("nFont",      _wintypes.DWORD),
                 ("dwFontSize", _COORD),
-                ("FontFamily", wintypes.UINT),
-                ("FontWeight", wintypes.UINT),
-                ("FaceName",   wintypes.WCHAR * 32),
+                ("FontFamily", _wintypes.UINT),
+                ("FontWeight", _wintypes.UINT),
+                ("FaceName",   _wintypes.WCHAR * 32),
             ]
 
         kernel32 = ctypes.windll.kernel32
@@ -283,13 +283,11 @@ def _normalize_console_font(height: int = CONSOLE_FONT_HEIGHT) -> bool:
             font = _CONSOLE_FONT_INFOEX()
             font.cbSize = ctypes.sizeof(_CONSOLE_FONT_INFOEX)
             kernel32.GetCurrentConsoleFontEx(handle, False, ctypes.byref(font))
-            # Keep a sane TrueType face; otherwise use Consolas (a fixed-width font
-            # that renders the block-bar/ANSI glyphs cleanly).
             if not font.FaceName or font.FaceName.startswith("\x00"):
                 font.FaceName = "Consolas"
-                font.FontFamily = 54   # FF_DONTCARE | TMPF_TRUETYPE
-                font.FontWeight = 400
-            font.dwFontSize = _COORD(0, height)   # width auto
+                font.FontFamily = _CONSOLE_FONT_FAMILY
+                font.FontWeight = _CONSOLE_FONT_WEIGHT
+            font.dwFontSize = _COORD(0, height)
             return bool(kernel32.SetCurrentConsoleFontEx(handle, False, ctypes.byref(font)))
         finally:
             kernel32.CloseHandle(handle)
@@ -788,11 +786,7 @@ TITLE_COLORS: List[int] = [
 SPINNER_CHARS: str = "@#$%&*+=?!<>()[]{}"
 
 # ── Live Controls Footer (shown at the bottom while scanning) ────────────────
-CONTROLS_HINT_RUNNING: str = "[P] Pause    [Q] Abbrechen (Ergebnis speichern)    [ESC] Sofort beenden"
-CONTROLS_HINT_PAUSED:  str = "PAUSE  —  [P] weiter    [Q] abbrechen    [ESC] beenden"
-# Shown the instant ESC is pressed so the screen reads as an intentional shutdown
-# (not a freeze) during the brief moment the process tears down. EN + DE.
-CLOSING_MESSAGE: str = "Beende Network Scanner …  /  Closing Network Scanner …"
+CLOSING_MESSAGE: str = "Closing Network Scanner …"
 
 # ── Phase Numbers ────────────────────────────────────────────────────────────
 PHASE_DISCOVERY: int = 1
@@ -2770,6 +2764,7 @@ class LiveTable:
             return self._render_internal_locked(clear_first=clear_first)
 
     def _render_internal_locked(self, clear_first: bool = False, _rebuilding: bool = False):
+        devs = list(self.devices.values())
         output = []
         output.append(f"{COLOR_BLUE}{'=' * self.table_width}{COLOR_RESET}")
 
@@ -2856,8 +2851,8 @@ class LiveTable:
         gw_str   = ni.get('gateway',     UNKNOWN_VALUE) or UNKNOWN_VALUE
         dns_str  = ni.get('dns_servers', [UNKNOWN_VALUE])[0] if ni.get('dns_servers') else UNKNOWN_VALUE
 
-        on  = [d for d in self.devices.values() if d.ping_status]
-        off = [d for d in self.devices.values() if not d.ping_status and (
+        on  = [d for d in devs if d.ping_status]
+        off = [d for d in devs if not d.ping_status and (
             (d.mac_address and d.mac_address != UNKNOWN_VALUE) or
             (d.hostname   and d.hostname   != UNKNOWN_VALUE)
         )]
@@ -3023,9 +3018,9 @@ class LiveTable:
             output.append(line)
 
         # Whole Network summary row
-        all_avgs = [d.ping_stats.get('avg') for d in self.devices.values() if d.ping_stats.get('avg') is not None]
-        all_mins = [d.ping_stats.get('min') for d in self.devices.values() if d.ping_stats.get('min') is not None]
-        all_maxs = [d.ping_stats.get('max') for d in self.devices.values() if d.ping_stats.get('max') is not None]
+        all_avgs = [d.ping_stats.get('avg') for d in devs if d.ping_stats.get('avg') is not None]
+        all_mins = [d.ping_stats.get('min') for d in devs if d.ping_stats.get('min') is not None]
+        all_maxs = [d.ping_stats.get('max') for d in devs if d.ping_stats.get('max') is not None]
         if all_avgs:
             net_avg = sum(all_avgs) / len(all_avgs)
             net_min = min(all_mins) if all_mins else None
@@ -3057,7 +3052,7 @@ class LiveTable:
 
         # Separator between the Whole Network row and the internet pings.
         output.append(f"{COLOR_BLUE}{'-' * self.table_width}{COLOR_RESET}")
-        output.extend(self._get_statistics_lines(list(self.devices.values()), colors=True))
+        output.extend(self._get_statistics_lines(devs, colors=True))
         output.append(f"{COLOR_BLUE}{'=' * self.table_width}{COLOR_RESET}")
 
         # Controls hint footer — only while actively scanning. Turns yellow and
@@ -3068,10 +3063,9 @@ class LiveTable:
             # current value is highlighted and updates on every +/- press.
             timeout_ctrl = f"[+/-] Timeout: {COLOR_BRIGHT_WHITE}{self.ping_interval_ms}ms{base}"
             if self.paused:
-                parts = ["PAUSE  —  [P] weiter", "[Q] abbrechen", timeout_ctrl, "[ESC] beenden"]
+                parts = ["PAUSED  —  [P] Resume", "[Q] Stop & save", timeout_ctrl, "[ESC] Quit"]
             else:
-                parts = ["[P] Pause", "[Q] Abbrechen (Ergebnis speichern)",
-                         timeout_ctrl, "[ESC] Sofort beenden"]
+                parts = ["[P] Pause", "[Q] Stop & save", timeout_ctrl, "[ESC] Quit now"]
             hint = f"{base}{'    '.join(parts)}{COLOR_RESET}"
             pad = max(0, (self.table_width - get_visible_len(hint)) // 2)
             output.append(" " * pad + hint)
@@ -4362,7 +4356,7 @@ def main(ping_count: int = DEFAULT_PING_COUNT, high_pressure: bool = False) -> s
     _hard_clear()
     live_table._render(force=True, clear_first=True)
 
-    # Both a finished scan and a Q ("Abbrechen, Ergebnis speichern") land here:
+    # Both a finished scan and a Q ("Stop & save") land here:
     # results are saved and the restart controls menu is shown (which displays
     # the saved-results path beneath it). Only ESC quits immediately — it never
     # reaches this point because _hard_exit_now() exits the process directly.

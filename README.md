@@ -2,7 +2,6 @@
 
 Pings every host on your `/24` subnet and tracks live latency — min, max, average, last — in a terminal table that updates in place. Runs on Windows, no admin rights required.
 
-![Network Scanner](docs/preview.png)
 
 ---
 
